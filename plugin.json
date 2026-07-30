@@ -1,0 +1,156 @@
+{
+  "id": "googledrive",
+  "kind": "plugin",
+  "version": "1.0.11",
+  "label": "Google Drive",
+  "description": "Pull 3D models, textures, and audio straight from Google Drive into UEFN. One-click 'Sign in with Google' (read-only), point it at one Drive folder you drop assets into, and Ducky downloads them safely (allowlisted types, size caps, nothing executed) and imports them as ready-to-use assets.",
+  "min_app_version": "1.0.493",
+  "default_enabled": false,
+  "secret_keys": [
+    "gdrive_api_key",
+    "gdrive_oauth_client_id",
+    "gdrive_oauth_client_secret",
+    "gdrive_oauth_token"
+  ],
+  "contributes": {
+    "settings.tabs": [
+      {
+        "id": "GoogleDrive",
+        "label": "Google Drive",
+        "icon": "assets/icon.svg"
+      }
+    ],
+    "settings.sections": [
+      {
+        "tab": "GoogleDrive",
+        "id": "signin",
+        "title": "Sign in with Google",
+        "description": "Just ask your ducky to \"connect Google Drive\" \u2014 a Google sign-in opens in your browser, you pick your account and approve read-only access, and that's it. Nothing to paste. The app only ever receives a read-only token (stored encrypted on this device); your password never touches it. Say \"disconnect Google Drive\" to sign out.",
+        "order": 10,
+        "properties": []
+      },
+      {
+        "tab": "GoogleDrive",
+        "id": "folder",
+        "title": "Your Drive folder",
+        "description": "Optional but handy: paste the link (or id) of one Drive folder where you keep assets. Then \"list my Drive\" / \"search my Drive\" default to that folder, so you just drop models into it and ask Ducky to pull them. Leave blank to browse your whole Drive.",
+        "order": 20,
+        "properties": [
+          {
+            "id": "target_folder",
+            "type": "string",
+            "label": "Drive folder link or id",
+            "placeholder": "https://drive.google.com/drive/folders/\u2026",
+            "description": "Right-click the folder in Google Drive \u2192 Share \u2192 Copy link, and paste it here. Everything you drop in that folder becomes pullable into UEFN."
+          }
+        ]
+      },
+      {
+        "tab": "GoogleDrive",
+        "id": "downloads",
+        "title": "Downloads",
+        "description": "Files land in the app's staging folder (AppData \u2192 downloads/googledrive) and are imported into UEFN from there. Only model/texture/audio/zip files are ever downloaded; zips are extracted with the same allowlist; nothing is executed.",
+        "order": 30,
+        "properties": [
+          {
+            "id": "max_download_mb",
+            "type": "select",
+            "label": "Max download size",
+            "default": "512",
+            "description": "Hard cap per file (and 2\u00d7 this for a zip's extracted contents).",
+            "options": [
+              {
+                "value": "100",
+                "label": "100 MB"
+              },
+              {
+                "value": "512",
+                "label": "512 MB \u2014 default"
+              },
+              {
+                "value": "2048",
+                "label": "2 GB"
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "tab": "GoogleDrive",
+        "id": "advanced",
+        "title": "Advanced (optional)",
+        "description": "You do not need any of this for normal use. Use your own Google Cloud project only if you'd rather not use the built-in sign-in: paste a Desktop-app OAuth Client ID + secret to override it. An API key lets you browse public 'anyone with link' folders without signing in at all.",
+        "order": 40,
+        "properties": [
+          {
+            "id": "gdrive_oauth_client_id",
+            "type": "secret",
+            "label": "OAuth Client ID (override)",
+            "placeholder": "\u2026.apps.googleusercontent.com",
+            "description": "From your own Google Cloud project (Desktop app client). Overrides the built-in sign-in."
+          },
+          {
+            "id": "gdrive_oauth_client_secret",
+            "type": "secret",
+            "label": "OAuth Client secret (override)",
+            "placeholder": "GOCSPX-\u2026",
+            "description": "Shown next to the Client ID when you create it."
+          },
+          {
+            "id": "gdrive_api_key",
+            "type": "secret",
+            "label": "Google API key",
+            "placeholder": "AIza\u2026",
+            "description": "Optional. Only needed to browse public folders without signing in."
+          }
+        ]
+      }
+    ],
+    "agent.tools": {
+      "category": "googledrive",
+      "tools": [
+        "gdrive_status",
+        "gdrive_connect",
+        "gdrive_disconnect",
+        "gdrive_list",
+        "gdrive_search",
+        "gdrive_file_info",
+        "gdrive_download",
+        "gdrive_import_to_uefn"
+      ],
+      "intent_pattern": "\\b(google\\s*drive|gdrive|drive\\.google|drive\\s+(link|folder|file))\\b",
+      "plan_tools": [
+        "gdrive_status",
+        "gdrive_list",
+        "gdrive_search",
+        "gdrive_file_info"
+      ]
+    },
+    "walkthrough": {
+      "id": "googledrive",
+      "title": "Google Drive setup",
+      "auto_start": "first_enable",
+      "settings_tab": "GoogleDrive",
+      "steps": [
+        {
+          "target": "settings.tab.google-drive",
+          "title": "Google Drive setup",
+          "body": "Connect Drive and point at a folder of assets. Press Google Drive to open settings.",
+          "advance": "require_click",
+          "mode": "rect"
+        },
+        {
+          "target": "settings.tab.google-drive",
+          "title": "You're set",
+          "body": "Ask the agent to connect Google Drive (browser sign-in), set an optional folder link, then pull models/textures/audio into UEFN.",
+          "advance": "next",
+          "mode": "rect"
+        }
+      ]
+    }
+  },
+  "backend": {
+    "entry": "backend",
+    "register": "register"
+  }
+}

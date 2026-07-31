@@ -11,4 +11,8 @@ Install or update from **Settings → Store** in the app — do not install from
 py scripts/build_zip.py
 ```
 
-Writes `deploy/googledrive-*.ducky-plugin.zip` (scripts/ and deploy/ are not packed).
+Writes `deploy/googledrive-1.0.10.ducky-plugin.zip` (scripts/ and deploy/ are not packed).
+
+## Secrets
+
+Never commit tokens or keys. The app stores `gdrive_api_key`, `gdrive_oauth_client_id`, `gdrive_oauth_client_secret`, `gdrive_oauth_token` locally (DPAPI), not in this package.

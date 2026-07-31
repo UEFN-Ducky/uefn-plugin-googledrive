@@ -393,7 +393,7 @@ def _target_folder_id() -> str:
 
 
 def _staging_dir() -> Path:
-    from backend.skill import appdata_dir
+    from backend.skills.store import appdata_dir
 
     path = appdata_dir() / "downloads" / "googledrive"
     path.mkdir(parents=True, exist_ok=True)
@@ -402,7 +402,7 @@ def _staging_dir() -> Path:
 
 def _tool_json(payload: dict[str, Any], pretty: bool = False) -> str:
     try:
-        from backend.json_util import tool_json
+        from backend.util.json_util import tool_json
 
         return tool_json(payload, pretty=pretty)
     except Exception:  # noqa: BLE001 — standalone / early-boot fallback

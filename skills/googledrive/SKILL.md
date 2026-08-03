@@ -1,10 +1,10 @@
 ---
 name: googledrive
 description: "Pull 3D models, textures, and audio from Google Drive and import them into UEFN as real, usable assets — browse/search Drive, download safely, import, then verify"
-license: All Rights Reserved
+license: Ducky Source-Available License v1.0
 metadata:
   label: Google Drive
-  version: 1
+  version: 2
   author: UEFN-Ducky
   copyright: Copyright 2026 UEFN-Ducky
   allow_redistribute: false
@@ -13,6 +13,10 @@ metadata:
 ---
 
 # Google Drive → UEFN asset pipeline
+
+**CRITICAL — after import, place/wire is SERIAL:** one `spawn_actor` / wire →
+wait → next (`skill_read_subskill("uefn", "batch_commands")`). Imports are
+already one-file-at-a-time — do not parallelize place/wire either.
 
 Fetch model/texture/audio files from the user's Google Drive (or public share links) and turn them into real UEFN assets. Downloads are sandboxed: allowlisted file types only (`.fbx .glb .gltf .obj`, textures, `.wav` + more audio, `.zip`), size caps, files land in a local staging folder, nothing is ever executed.
 

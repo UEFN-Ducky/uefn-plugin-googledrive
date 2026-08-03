@@ -1,7 +1,7 @@
 {
   "id": "googledrive",
   "kind": "plugin",
-  "version": "1.0.12",
+  "version": "1.0.15",
   "label": "Google Drive",
   "description": "Pull 3D models, textures, and audio straight from Google Drive into UEFN. One-click 'Sign in with Google' (read-only), point it at one Drive folder you drop assets into, and Ducky downloads them safely (allowlisted types, size caps, nothing executed) and imports them as ready-to-use assets.",
   "min_app_version": "1.0.493",

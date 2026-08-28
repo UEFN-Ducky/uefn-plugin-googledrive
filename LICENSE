@@ -19,10 +19,3 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
-
----
-
-Bundled skills: any skills/ directory or skill pack shipped with this plugin
-is NOT covered by the MIT license above. Those materials are licensed under
-the Ducky Source-Available License v1.0 (Mindful Path Company, LLC). See
-skills/*/SKILL.md and/or LICENSE.txt inside the skill folder.

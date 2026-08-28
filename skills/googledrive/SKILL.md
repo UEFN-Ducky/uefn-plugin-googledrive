@@ -1,13 +1,13 @@
 ---
 name: googledrive
 description: "Pull 3D models, textures, and audio from Google Drive and import them into UEFN as real, usable assets — browse/search Drive, download safely, import, then verify"
-license: Ducky Source-Available License v1.0
+license: MIT
 metadata:
   label: Google Drive
   version: 2
   author: UEFN-Ducky
-  copyright: Copyright 2026 UEFN-Ducky
-  allow_redistribute: false
+  copyright: Copyright 2026 Mindful Path Company, LLC
+  allow_redistribute: true
   managed_by: uefn-ducky
   source_plugin_id: googledrive
 ---
@@ -47,10 +47,10 @@ Fetch model/texture/audio files from the user's Google Drive (or public share li
 1. `gdrive_status` → if not signed in and they want their own Drive, run `gdrive_connect` and tell them to finish the Google sign-in in their browser. (A pasted public share link needs no sign-in — just use it.)
 2. Find the file: user's pasted link, or — since their assets folder is usually the **target folder** — just `gdrive_list()` with no args, or `gdrive_search(query="duck", kind="model")`.
 3. Optional for big files: `gdrive_file_info` — confirm size is within the cap and the type is importable.
-4. `get_project_info()` → `content_root`, then `gdrive_import_to_uefn(file=<link or id>, destination_path="/VideoTest/Models/<Thing>")` — or omit / pass `""` (defaults to relative `Imported`, listener pins).
+4. `get_project_info()` → `content_root`, then `gdrive_import_to_uefn(file=<link or id>, destination_path="/MyProject/Models/<Thing>")` — or omit / pass `""` (defaults to relative `Imported`, listener pins).
    - Zips: extracted safely; every importable file inside is imported, textures before models.
    - Or two-step: `gdrive_download` → existing `import_asset` per file (same pipeline).
-5. **Verify — do not skip:** `validate_uefn_asset` on the new asset path, `get_static_mesh_info` / `preview_asset` to sanity-check, then `save_directory` on the project folder (e.g. `/VideoTest/Models`).
+5. **Verify — do not skip:** `validate_uefn_asset` on the new asset path, `get_static_mesh_info` / `preview_asset` to sanity-check, then `save_directory` on the project folder (e.g. `/MyProject/Models`).
 6. Set up the mesh properly (collision, LODs, Nanite, placement): follow the **modeling** skill. Place with `spawn_actor` or wire into Verse via the **uefn** skill.
 
 ## Rules

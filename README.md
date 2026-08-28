@@ -16,3 +16,7 @@ Writes `deploy/googledrive-1.0.10.ducky-plugin.zip` (scripts/ and deploy/ are no
 ## Secrets
 
 Never commit tokens or keys. The app stores `gdrive_api_key`, `gdrive_oauth_client_id`, `gdrive_oauth_client_secret`, `gdrive_oauth_token` locally (DPAPI), not in this package.
+
+## License
+
+MIT. Copyright (c) 2026 Mindful Path Company, LLC. See [LICENSE](LICENSE).

@@ -1342,7 +1342,7 @@ def register(api: Any) -> None:
 
         Pass file=<Drive link/id> (downloads first) or local_path=<already-downloaded
         file>. Models (.fbx/.glb/.gltf/.obj), textures, and .wav are imported into
-        destination_path (project content path e.g. /VideoTest/Models, or relative
+        destination_path (project content path e.g. /MyProject/Models, or relative
         e.g. Imported/Props — listener pins to content_root) via the editor's import
         pipeline; zips are extracted and every importable file inside is imported
         (textures first, so materials resolve). Requires UEFN online with the Ducky
@@ -1354,7 +1354,7 @@ def register(api: Any) -> None:
             if not re.match(r"^/?[A-Za-z0-9_][A-Za-z0-9_\-/ .]*$", dest):
                 raise ValueError(
                     f"destination_path {dest!r} is not a valid content path — "
-                    "use e.g. /VideoTest/Models/Props or Models/Props "
+                    "use e.g. /MyProject/Models/Props or Models/Props "
                     "(listener pins relative paths to content_root)"
                 )
             files: list[Path] = []

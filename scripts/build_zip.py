@@ -75,6 +75,7 @@ def build_zip(*, out: Path | None = None) -> Path:
     tmp.write_bytes(raw)
     tmp.replace(dest)
     print(f"wrote {dest} ({dest.stat().st_size} bytes, CRC ok)")
+    _prune_superseded_zips(dest)
     return dest
 
 

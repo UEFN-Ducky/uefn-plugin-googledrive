@@ -17,6 +17,21 @@ Writes `deploy/googledrive-1.0.10.ducky-plugin.zip` (scripts/ and deploy/ are no
 
 Never commit tokens or keys. The app stores `gdrive_api_key`, `gdrive_oauth_client_id`, `gdrive_oauth_client_secret`, `gdrive_oauth_token` locally (DPAPI), not in this package.
 
+## Next release: ship compiled
+
+This plugin still ships its Python source on the Store. Its next release has to ship compiled and signed, the way Ducky Account and Roguelike do:
+
+1. Give `scripts/release.py` and `scripts/build_zip.py` the compiled build from `uefn-plugin-account` (`build_compiled_zip`, upload by ticket, `--plain` only as an escape hatch).
+2. Bump `version` and set `min_app_version` to `1.2.356` or newer.
+3. Publish, then check the download with the start-up license check (signature, id and version, compiled, team access), not only the signature.
+4. The Store must hold the version back from apps older than `min_app_version`. Until it does, older apps install a build they can't run.
+
+For this plugin:
+
+- `backend/__init__.py` runs `scripts/selfcheck.py`, which a compiled build doesn't ship. Only run it when the file is there.
+
+Remove this section once a compiled version is live.
+
 ## License
 
 MIT. Copyright (c) 2026 Mindful Path Company, LLC. See [LICENSE](LICENSE).

@@ -15,7 +15,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
-import base64
+import hashlib
 import json
 import os
 import sys
@@ -27,7 +27,7 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 ROOT = SCRIPT_DIR.parent
 sys.path.insert(0, str(SCRIPT_DIR))
 
-from build_zip import build_zip  # noqa: E402
+from build_zip import build_compiled_zip, build_zip  # noqa: E402
 
 
 def _load_dotenv() -> None:
@@ -93,6 +93,55 @@ def mcp_call(base_url: str, api_key: str, name: str, arguments: dict) -> dict:
     return result if isinstance(result, dict) else {"ok": True, "result": result}
 
 
+def _unwrap(result: dict, key: str) -> dict:
+    """The dict holding ``key`` in a tool result (the host may nest ``payload``)."""
+    node = result
+    for _ in range(4):
+        if not isinstance(node, dict) or key in node:
+            break
+        node = node.get("payload")
+    return node if isinstance(node, dict) else {}
+
+
+def upload_with_ticket(base_url: str, api_key: str, zip_path: Path) -> str:
+    """Upload the zip straight to the Store's storage and return its uploadId.
+
+    ``uds_upload_ticket`` hands out a presigned PUT with the size signed; the zip goes
+    there, and ``uds_release`` then names it by id. The compiled build is far too big
+    for an MCP call (64 KB) or the Store plugin's messages (1 MiB).
+    """
+    data = zip_path.read_bytes()
+    ticket = _unwrap(
+        mcp_call(
+            base_url,
+            api_key,
+            "uds_upload_ticket",
+            {"size": len(data), "sha256": hashlib.sha256(data).hexdigest(), "purpose": "release"},
+        ),
+        "uploadId",
+    )
+    upload_id = str(ticket.get("uploadId") or "").strip()
+    put_url = str(ticket.get("putUrl") or "").strip()
+    if not upload_id or not put_url:
+        raise SystemExit(f"Upload ticket failed: {ticket}")
+    req = urllib.request.Request(
+        put_url,
+        data=data,
+        method="PUT",
+        # The size is signed into the link; it must match exactly.
+        headers={"Content-Length": str(len(data)), "User-Agent": "UEFN-Ducky-PluginRelease/1.0"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=600) as resp:
+            resp.read()
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")
+        raise SystemExit(f"Upload PUT HTTP {exc.code}: {detail}") from exc
+    except (OSError, urllib.error.URLError) as exc:
+        raise SystemExit(f"Upload PUT failed: {exc}") from exc
+    return upload_id
+
+
 def publish(zip_path: Path, *, category: str, changelog: str) -> None:
     _load_dotenv()
     base = (
@@ -103,16 +152,17 @@ def publish(zip_path: Path, *, category: str, changelog: str) -> None:
     key = os.environ.get("DUCKYOS_API_KEY") or os.environ.get("DUCKYOS_MARKETPLACE_API_KEY") or ""
     if not key:
         raise SystemExit("Set DUCKYOS_API_KEY (staff key with mcp_remote scopes) to publish")
-    zip_b64 = base64.b64encode(zip_path.read_bytes()).decode("ascii")
     print(f"ensuring category {category!r}…")
     mcp_call(base, key, "uds_ensure_category", {"name": category, "slug": category})
-    print(f"releasing {zip_path.name}…")
+    print(f"uploading {zip_path.name} ({zip_path.stat().st_size} bytes) with an upload ticket…")
+    upload_id = upload_with_ticket(base, key, zip_path)
+    print(f"releasing via uds_release (uploadId={upload_id})…")
     result = mcp_call(
         base,
         key,
         "uds_release",
         {
-            "zipB64": zip_b64,
+            "uploadId": upload_id,
             "category": category,
             "changelog": changelog,
             "publish": True,
@@ -131,6 +181,11 @@ def main() -> None:
     )
     parser.add_argument("--changelog", default="", help="Version changelog for Store")
     parser.add_argument("--category", default=os.environ.get("UDS_CATEGORY") or "plugins")
+    parser.add_argument(
+        "--plain",
+        action="store_true",
+        help="ship the readable Python source instead of the compiled build",
+    )
     args = parser.parse_args()
 
     if args.sync_seed:
@@ -142,7 +197,8 @@ def main() -> None:
         from commit_before_store import commit_and_push_before_publish
 
         commit_and_push_before_publish(ROOT, args.changelog)
-    zip_path = build_zip()
+    # The Store gets the compiled build: no Python source ships, and the license check is baked in.
+    zip_path = build_zip() if args.plain else build_compiled_zip(release=args.publish)
     if args.publish:
         publish(zip_path, category=args.category, changelog=args.changelog)
     else:

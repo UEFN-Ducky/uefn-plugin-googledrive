@@ -1456,4 +1456,6 @@ def register(api: Any) -> None:
 
 if __name__ == "__main__":
     import runpy, pathlib
-    runpy.run_path(str(pathlib.Path(__file__).resolve().parents[1] / "scripts" / "selfcheck.py"), run_name="__main__")
+    selfcheck = pathlib.Path(__file__).resolve().parents[1] / "scripts" / "selfcheck.py"
+    if selfcheck.is_file():  # a compiled build ships no scripts/
+        runpy.run_path(str(selfcheck), run_name="__main__")

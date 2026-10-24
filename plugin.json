@@ -1,9 +1,9 @@
 {
   "id": "googledrive",
   "kind": "plugin",
-  "version": "1.0.18",
-  "label": "Google Drive",
-  "description": "Pull 3D models, textures, and audio straight from Google Drive into UEFN. One-click 'Sign in with Google' (read-only), point it at one Drive folder you drop assets into, and Ducky downloads them safely (allowlisted types, size caps, nothing executed) and imports them as ready-to-use assets.",
+  "version": "1.1.0",
+  "label": "Google Workspace",
+  "description": "Gmail and Google Drive in one tab, with one Google sign-in. Read, search, draft and organize mail across several Google accounts, and pull 3D models, textures and audio from Drive straight into UEFN (allowlisted types, size caps, nothing executed). Ducky can do everything the tab can; sending, trash and sharing always ask first, and mail stays on this PC.",
   "min_app_version": "1.2.357",
   "default_enabled": false,
   "data_sharing": false,
@@ -110,6 +110,11 @@
     "agent.tools": {
       "category": "googledrive",
       "tools": [
+        "google_status",
+        "google_connect",
+        "google_disconnect",
+        "google_accounts_list",
+        "google_open",
         "gdrive_status",
         "gdrive_connect",
         "gdrive_disconnect",
@@ -117,16 +122,90 @@
         "gdrive_search",
         "gdrive_file_info",
         "gdrive_download",
-        "gdrive_import_to_uefn"
+        "gdrive_import_to_uefn",
+        "gdrive_upload",
+        "gdrive_folder_create",
+        "gdrive_move",
+        "gdrive_rename",
+        "gdrive_copy",
+        "gdrive_trash",
+        "gdrive_untrash",
+        "gdrive_share",
+        "gdrive_storage_usage",
+        "gmail_list",
+        "gmail_search",
+        "gmail_get",
+        "gmail_thread_get",
+        "gmail_labels_list",
+        "gmail_unread_count",
+        "gmail_find",
+        "gmail_attachment_download",
+        "gmail_attachment_import_to_uefn",
+        "gmail_draft_create",
+        "gmail_draft_update",
+        "gmail_draft_list",
+        "gmail_draft_send",
+        "gmail_send",
+        "gmail_reply",
+        "gmail_forward",
+        "gmail_modify",
+        "gmail_mark_read",
+        "gmail_mark_unread",
+        "gmail_archive",
+        "gmail_star",
+        "gmail_trash",
+        "gmail_untrash",
+        "gmail_label_create",
+        "gmail_label_delete"
       ],
-      "intent_pattern": "\\b(google\\s*drive|gdrive|drive\\.google|drive\\s+(link|folder|file))\\b",
+      "intent_pattern": "\\b(google\\s*(drive|workspace|account)|gdrive|drive\\.google|drive\\s+(link|folder|file)s?|g-?mail|e-?mails?|inbox|mailbox)\\b",
       "plan_tools": [
+        "google_status",
+        "google_accounts_list",
         "gdrive_status",
         "gdrive_list",
         "gdrive_search",
-        "gdrive_file_info"
+        "gdrive_file_info",
+        "gdrive_storage_usage",
+        "gmail_list",
+        "gmail_search",
+        "gmail_get",
+        "gmail_thread_get",
+        "gmail_labels_list",
+        "gmail_unread_count",
+        "gmail_find",
+        "gmail_draft_list"
+      ],
+      "destructive_tools": [
+        "gmail_send",
+        "gmail_draft_send",
+        "gmail_reply",
+        "gmail_forward",
+        "gmail_trash",
+        "gmail_label_delete",
+        "gdrive_trash",
+        "gdrive_share",
+        "google_disconnect",
+        "gdrive_disconnect"
       ]
     },
+    "ui.panels": [
+      {
+        "id": "main",
+        "title": "Google Workspace",
+        "icon": "assets/icon.svg",
+        "entry": "ui/index.html"
+      }
+    ],
+    "header.buttons": [
+      {
+        "id": "main",
+        "title": "Google Workspace",
+        "icon": "assets/icon.svg",
+        "action": "panel:main",
+        "order": 60
+      }
+    ],
     "walkthrough": {
       "id": "googledrive",
       "title": "Google Drive setup",

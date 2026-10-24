@@ -1,0 +1,78 @@
+"""plugin.json checks for the Google Workspace (id googledrive) manifest."""
+from __future__ import annotations
+
+import json
+import re
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+MANIFEST = json.loads((ROOT / "plugin.json").read_text(encoding="utf-8"))
+CONTRIB = MANIFEST["contributes"]
+TOOLS = CONTRIB["agent.tools"]
+
+
+def test_identity_kept_for_existing_users():
+    assert MANIFEST["id"] == "googledrive"
+    assert MANIFEST["label"] == "Google Workspace"
+    assert MANIFEST["version"] == "1.1.0"
+    assert MANIFEST["min_app_version"] == "1.2.357"
+    assert MANIFEST["data_sharing"] is False
+    assert MANIFEST["default_enabled"] is False
+    assert MANIFEST["backend"] == {"entry": "backend", "register": "register"}
+
+
+def test_intent_pattern_covers_gmail_and_drive():
+    pattern = re.compile(TOOLS["intent_pattern"], re.IGNORECASE)
+    for text in (
+        "check my gmail",
+        "any new email from Sam?",
+        "clean up my inbox",
+        "search my emails for the invoice",
+        "pull the duck from google drive",
+        "here's a drive link",
+        "connect my google workspace",
+    ):
+        assert pattern.search(text), text
+    for text in ("build verse", "spawn a car", "drive the car"):
+        assert not pattern.search(text), text
+
+
+def test_plan_tools_are_read_only_and_listed():
+    listed = set(TOOLS["tools"])
+    plan = set(TOOLS["plan_tools"])
+    destructive = set(TOOLS["destructive_tools"])
+    assert plan <= listed
+    assert destructive <= listed
+    assert not plan & destructive
+    write_words = ("send", "reply", "forward", "trash", "delete", "share", "modify", "move",
+                   "rename", "upload", "create", "connect", "disconnect", "archive", "star", "mark")
+    for name in plan:
+        assert not any(w in name for w in write_words), name
+
+
+def test_destructive_tools_ask_first():
+    destructive = set(TOOLS["destructive_tools"])
+    for name in ("gmail_send", "gmail_draft_send", "gmail_reply", "gmail_forward", "gmail_trash",
+                 "gmail_label_delete", "gdrive_trash", "gdrive_share", "google_disconnect",
+                 "gdrive_disconnect"):
+        assert name in destructive, name
+
+
+def test_old_drive_tools_still_listed():
+    for name in ("gdrive_status", "gdrive_connect", "gdrive_disconnect", "gdrive_list", "gdrive_search",
+                 "gdrive_file_info", "gdrive_download", "gdrive_import_to_uefn"):
+        assert name in TOOLS["tools"], name
+
+
+def test_tab_panel_and_header_button():
+    panels = {p["id"]: p for p in CONTRIB["ui.panels"]}
+    assert panels["main"]["entry"] == "ui/index.html"
+    buttons = CONTRIB["header.buttons"]
+    assert any(b["action"] == "panel:main" for b in buttons)
+
+
+def test_no_secret_values_in_manifest():
+    text = (ROOT / "plugin.json").read_text(encoding="utf-8")
+    assert not re.search(r"GOCSPX-[A-Za-z0-9_-]{10,}", text)
+    assert not re.search(r"AIza[0-9A-Za-z_-]{30,}", text)
+    assert not re.search(r"\d{6,}-[a-z0-9]{20,}\.apps\.googleusercontent\.com", text)

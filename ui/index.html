@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Google Workspace</title>
+  <script src="../../_kit/ducky.js"></script>
+  <link rel="stylesheet" href="shared/shell.css">
+</head>
+<body class="dk-page gw">
+  <header class="gw-top">
+    <div class="gw-pills" role="tablist" aria-label="Google apps">
+      <button class="gw-pill is-on" type="button" role="tab" data-view="gmail" aria-selected="true">Gmail</button>
+      <button class="gw-pill" type="button" role="tab" data-view="drive" aria-selected="false" tabindex="-1">Drive</button>
+    </div>
+    <div class="gw-account-bar" id="gw-account-bar"></div>
+  </header>
+  <main class="gw-main">
+    <section class="gw-gate" id="gw-gate"><div class="dk-loading">Loading…</div></section>
+    <section class="gw-view" data-view="gmail" role="tabpanel" aria-label="Gmail" hidden></section>
+    <section class="gw-view" data-view="drive" role="tabpanel" aria-label="Drive" hidden></section>
+  </main>
+  <script src="shared/bridge.js"></script>
+  <script src="shared/shell.js"></script>
+  <script>GW.shell.start();</script>
+</body>
+</html>

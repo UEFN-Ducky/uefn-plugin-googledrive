@@ -64,6 +64,23 @@ def test_old_drive_tools_still_listed():
         assert name in TOOLS["tools"], name
 
 
+def test_every_gmail_tool_is_model_gated():
+    sensitive = TOOLS["sensitive"]
+    assert isinstance(sensitive, list)
+    gmail = {name for name in TOOLS["tools"] if name.startswith("gmail_")}
+    assert set(sensitive) == gmail
+    assert len(sensitive) == len(set(sensitive))
+    # Drive and account tools stay usable by every model.
+    assert not any(n.startswith(("gdrive_", "google_")) for n in sensitive)
+
+
+def test_settings_explain_allowed_models():
+    sections = {s["id"]: s for s in CONTRIB["settings.sections"]}
+    assert "Allowed models" in sections["access"]["description"]
+    gmail = next(p for p in sections["access"]["properties"] if p["id"] == "gmail_enabled")
+    assert "Allowed models" in gmail["description"]
+
+
 def test_tab_panel_and_header_button():
     panels = {p["id"]: p for p in CONTRIB["ui.panels"]}
     assert panels["main"]["entry"] == "ui/index.html"

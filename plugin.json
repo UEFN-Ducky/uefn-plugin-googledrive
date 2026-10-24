@@ -35,7 +35,7 @@
         "tab": "Google",
         "id": "access",
         "title": "What Ducky may use",
-        "description": "Sign-in starts with read-only Drive access. Each switch below adds its access only when you turn it on: Google asks you to approve it on the next sign-in. Mail and files go straight from this PC to Google and stay on this PC.",
+        "description": "Sign-in starts with read-only Drive access. Each switch below adds its access only when you turn it on: Google asks you to approve it on the next sign-in. Mail and files go straight from this PC to Google and stay on this PC. Mail is private: pick the AI models allowed to read it under Allowed models in this tab (empty = none; Drive tools are not affected).",
         "order": 20,
         "properties": [
           {
@@ -43,7 +43,7 @@
             "type": "boolean",
             "label": "Gmail",
             "default": false,
-            "description": "Read, search, draft and organize your mail. Sending, trash and label deletes always ask you first."
+            "description": "Read, search, draft and organize your mail in the Google Workspace tab. Sending, trash and label deletes always ask you first. AI models see your mail only if you add them to Allowed models below; until then no chat or workflow agent can use the Gmail tools."
           },
           {
             "id": "manage_drive",
@@ -281,6 +281,33 @@
         "gdrive_share",
         "google_disconnect",
         "gdrive_disconnect"
+      ],
+      "sensitive": [
+        "gmail_list",
+        "gmail_search",
+        "gmail_get",
+        "gmail_thread_get",
+        "gmail_labels_list",
+        "gmail_unread_count",
+        "gmail_find",
+        "gmail_attachment_download",
+        "gmail_attachment_import_to_uefn",
+        "gmail_draft_create",
+        "gmail_draft_update",
+        "gmail_draft_list",
+        "gmail_draft_send",
+        "gmail_send",
+        "gmail_reply",
+        "gmail_forward",
+        "gmail_modify",
+        "gmail_mark_read",
+        "gmail_mark_unread",
+        "gmail_archive",
+        "gmail_star",
+        "gmail_trash",
+        "gmail_untrash",
+        "gmail_label_create",
+        "gmail_label_delete"
       ]
     },
     "ui.panels": [

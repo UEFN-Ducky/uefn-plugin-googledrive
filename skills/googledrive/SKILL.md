@@ -20,6 +20,7 @@ metadata:
 - **Never send without asking.** `gmail_send`, `gmail_reply`, `gmail_forward` and `gmail_draft_send` go out only after the user said yes to the exact text and recipients. When unsure, save a draft (`gmail_draft_create`) and let them send it.
 - **No delete.** Nothing is ever deleted for good. Trash tools (`gmail_trash`, `gdrive_trash`), `gmail_label_delete` and `google_disconnect` first return a preview without `confirmed=true`; show the user the exact items with `ducky_ask_user`, then call again with `confirmed=true`. At most 50 items per confirmation. Revert in the Changes tab undoes trash, moves, archives and labels.
 - **Several accounts:** read tools search every connected account when `account` is empty and tag each row; write tools need `account` when more than one is connected.
+- **Gmail tools are model-gated.** Only models on **Settings → Google → Allowed models** see or call `gmail_*` tools. If a call says this model isn't allowed, don't retry: tell the user that only they can add it there. Drive and account tools are not gated.
 - Never ask for passwords, keys or tokens in chat; settings live in **Settings → Google**.
 
 ## Accounts and sign-in

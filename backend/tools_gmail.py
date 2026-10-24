@@ -22,41 +22,22 @@ agent run the same code.
 The Google sign-in lives elsewhere: ``accounts()`` names the connected accounts with
 Gmail turned on and ``client_for(account)`` returns a ``gmail.GmailClient`` for one.
 
-No package-relative imports: siblings are loaded by file, so tests can load this alone.
+Siblings are package-relative imports (compiled builds and draft validation need them);
+tests load this module as ``<pkg>.tools_gmail`` under a bare package for ``backend/``.
 """
 
 from __future__ import annotations
 
 import functools
-import importlib.util
 import json
 import mimetypes
 import re
 import stat
-import sys
 from email.utils import formataddr
 from pathlib import Path
 from typing import Any, Callable, Iterable
 
-_HERE = Path(__file__).resolve().parent
-
-
-def _sibling(name: str) -> Any:
-    """``backend/<name>.py``, loaded once by file (the package may not be importable)."""
-    key = f"_googledrive_{name}"
-    mod = sys.modules.get(key)
-    if mod is None:
-        spec = importlib.util.spec_from_file_location(key, _HERE / f"{name}.py")
-        mod = importlib.util.module_from_spec(spec)
-        sys.modules[key] = mod
-        spec.loader.exec_module(mod)
-    return mod
-
-
-gmail = _sibling("gmail")
-mime = _sibling("mime")
-display = _sibling("display")
-safety = _sibling("safety")
+from . import display, gmail, mime, safety
 
 DEFAULT_MAX = 20
 LIST_MAX = 100

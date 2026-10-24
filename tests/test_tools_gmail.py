@@ -2,16 +2,21 @@
 from __future__ import annotations
 
 import base64
-import importlib.util
+import importlib
 import itertools
+import sys
+import types
 from pathlib import Path
 
 import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
-_spec = importlib.util.spec_from_file_location("gw_tools_gmail", ROOT / "backend" / "tools_gmail.py")
-tg = importlib.util.module_from_spec(_spec)
-_spec.loader.exec_module(tg)
+# A bare package over backend/ so the module's relative imports resolve without running
+# backend/__init__.py (which needs the app's host).
+_pkg = types.ModuleType("gw_gmail_backend")
+_pkg.__path__ = [str(ROOT / "backend")]
+sys.modules.setdefault("gw_gmail_backend", _pkg)
+tg = importlib.import_module("gw_gmail_backend.tools_gmail")
 
 ME = "me@example.com"
 WORK = "work@example.com"

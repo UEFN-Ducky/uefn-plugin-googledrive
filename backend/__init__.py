@@ -17,7 +17,7 @@ import zipfile  # noqa: F401 — re-exported for scripts/selfcheck.py
 from pathlib import Path
 from typing import Any
 
-from . import auth, display
+from . import auth, display, mail_store, nodes, poller, tools_account, tools_drive, tools_gmail
 from .auth import (  # noqa: F401 — re-exported for scripts/selfcheck.py
     KEY_API,
     PLUGIN_ID,
@@ -71,130 +71,58 @@ def _tool_json(payload: dict[str, Any], pretty: bool = False) -> str:
 # --------------------------------------------------------------------------- #
 
 
+_POLLER: Any = None
+
+
+def _drive_status() -> dict[str, Any]:
+    """Drive details merged into google_status / gdrive_status (tools_account)."""
+    target_ref = _target_folder_ref()
+    target_id = _target_folder_id()
+    api_key_set = bool(auth._get_secret(KEY_API))
+    out: dict[str, Any] = {
+        "sign_in_kind": (
+            "bundled" if _using_bundled_client() else "custom" if auth._uses_own_client() else "none"
+        ),
+        "target_folder": target_ref or None,
+        "target_folder_id": target_id or None,
+        "api_key_set": api_key_set,
+        "access_modes": _auth_modes(),
+        "staging_dir": str(_staging_dir()),
+        "max_download": _human_size(_max_download_bytes()),
+        "allowed_extensions": sorted(ALLOWED_EXTS),
+        "importable_extensions": sorted(IMPORTABLE_EXTS),
+    }
+    if target_ref and not target_id:
+        out["drive_hint"] = f"'Your Drive folder' setting isn't a valid Drive folder link/id: {target_ref!r}"
+    elif not target_ref:
+        out["drive_hint"] = (
+            "Tip: set 'Your Drive folder' in Settings so gdrive_list / gdrive_search default "
+            "to one folder you drop assets into."
+        )
+    return out
+
+
+def _poll_seconds() -> Any:
+    from .drive import _prefs
+
+    return _prefs().get("gmail_poll_seconds") or poller.DEFAULT_INTERVAL_S
+
+
+def shutdown() -> None:
+    """Stop the new-mail poller (plugin unload, reinstall, tests)."""
+    global _POLLER
+    if _POLLER is not None:
+        _POLLER.stop()
+        _POLLER = None
+
+
 def register(api: Any) -> None:
-    """Wire the Google Drive tools into the app's shared MCP server."""
+    """Wire the Google Workspace tools, panel calls, nodes and the new-mail poller."""
+    global _POLLER
     auth.bind(api)
 
     def _fail(exc: Exception, pretty: bool) -> str:
         return _tool_json({"ok": False, "error": str(exc) or exc.__class__.__name__}, pretty=pretty)
-
-    @api.tool(intent=r"\b(google\s*drive|gdrive|drive\.google|drive\s+(link|folder|file))\b", listener=False)
-    def gdrive_status(pretty: bool = False) -> str:
-        """Google Drive plugin status: access modes, connected account, staging folder.
-
-        Call this first. Shows whether OAuth (private Drive), an API key (public
-        folders), or only public-link downloads are available, plus where files land
-        on disk and the active size cap.
-        """
-        try:
-            tok = _load_token()
-            client_id, client_secret = _oauth_client()
-            sign_in_ready = auth.sign_in_ready()
-            api_key_set = bool(auth._get_secret(KEY_API))
-            target_ref = _target_folder_ref()
-            target_id = _target_folder_id()
-            payload: dict[str, Any] = {
-                "ok": True,
-                "connected": bool(tok),
-                "account": str((tok or {}).get("email") or "") or None,
-                "sign_in_ready": sign_in_ready,
-                "sign_in_kind": (
-                    "bundled" if _using_bundled_client()
-                    else "custom" if sign_in_ready
-                    else "none"
-                ),
-                "target_folder": target_ref or None,
-                "target_folder_id": target_id or None,
-                "api_key_set": api_key_set,
-                "access_modes": _auth_modes(),
-                "staging_dir": str(_staging_dir()),
-                "max_download": _human_size(_max_download_bytes()),
-                "allowed_extensions": sorted(ALLOWED_EXTS),
-                "importable_extensions": sorted(IMPORTABLE_EXTS),
-            }
-            hints: list[str] = []
-            if tok:
-                hints.append(f"Signed in as {payload['account'] or 'your Google account'}.")
-            elif sign_in_ready:
-                hints.append(
-                    "Sign in: run gdrive_connect — a Google sign-in opens in the browser "
-                    "(one click, nothing to paste)."
-                )
-            else:
-                hints.append(
-                    "One-click sign-in isn't wired up in this build. Public share links "
-                    "still work via gdrive_download with no login."
-                )
-            if target_ref and not target_id:
-                hints.append(
-                    f"'Your Drive folder' setting isn't a valid Drive folder link/id: {target_ref!r}"
-                )
-            elif not target_ref:
-                hints.append(
-                    "Tip: set 'Your Drive folder' in Settings → Google Drive so gdrive_list / "
-                    "gdrive_search default to one folder you drop assets into."
-                )
-            if not api_key_set and not sign_in_ready:
-                hints.append(
-                    "To browse public folders without signing in, add a Google API key in "
-                    "Settings → Google Drive → Advanced."
-                )
-            if client_id and not client_id.endswith(".apps.googleusercontent.com"):
-                hints.append(
-                    "Warning: the OAuth Client ID does not look like *.apps.googleusercontent.com "
-                    "— double-check it."
-                )
-            payload["hints"] = hints
-            return _tool_json(payload, pretty=pretty)
-        except Exception as exc:  # noqa: BLE001 — never raise across the MCP bridge
-            return _fail(exc, pretty)
-
-    @api.tool(listener=False)
-    def gdrive_connect(timeout_s: float = 180.0, pretty: bool = False) -> str:
-        """Sign in with Google (read-only Drive scope) via one-click browser sign-in.
-
-        Opens the default browser on Google's own consent screen; the user picks
-        their account and approves read-only Drive — credentials never touch this
-        app, only a read-only token is stored (encrypted, on-device). Uses the
-        plugin's built-in Google client, so there is nothing to paste. Blocks until
-        sign-in completes or timeout_s (max 300) elapses. Tell the user to finish
-        the sign-in in their browser.
-        """
-        try:
-            result = _run_oauth_flow(float(timeout_s or 180.0))
-            account = result.get("account") or ""
-            return _tool_json(
-                {
-                    "ok": True,
-                    "connected": True,
-                    "account": account or None,
-                    "scope": "read-only (drive.readonly)",
-                    "message": (
-                        f"Connected to Google Drive as {account}." if account else
-                        "Connected to Google Drive."
-                    ),
-                },
-                pretty=pretty,
-            )
-        except Exception as exc:  # noqa: BLE001
-            return _fail(exc, pretty)
-
-    @api.tool(listener=False)
-    def gdrive_disconnect(revoke: bool = True, pretty: bool = False) -> str:
-        """Disconnect Google Drive: revoke the token at Google (best effort) and erase it."""
-        try:
-            revoked = auth.revoke_and_clear(bool(revoke))
-            return _tool_json(
-                {
-                    "ok": True,
-                    "connected": False,
-                    "revoked_at_google": revoked,
-                    "message": "Google Drive disconnected — the stored token was erased.",
-                },
-                pretty=pretty,
-            )
-        except Exception as exc:  # noqa: BLE001
-            return _fail(exc, pretty)
 
     @api.tool(listener=False)
     def gdrive_list(
@@ -477,4 +405,35 @@ def register(api: Any) -> None:
         """Take the last google_open request (view, item, search) once, as the Google tab does on open."""
         return _tool_json({"ok": True, "request": display.take_pending_open()}, pretty=pretty)
 
-    api.log("Google Drive tools registered")
+    # Accounts (google_* + the gdrive_status/connect/disconnect aliases) over auth.py.
+    account_tools = tools_account.register(api, auth=auth, extra_status=_drive_status)
+
+    tools_drive.register(api, accounts=account_tools.rows, token_for=lambda email: auth.access_token(email))
+
+    # Gmail: one client and one mail cache per account, shared by the tools and the poller.
+    stores: dict[str, Any] = {}
+
+    def client_for(account: str) -> Any:
+        token = auth.access_token_getter(account, scope=auth.SCOPE_GMAIL)
+        return tools_gmail.gmail.GmailClient(api.http_json, token)
+
+    def store_for(account: str) -> Any:
+        key = account.strip().lower()
+        if key not in stores:
+            stores[key] = mail_store.MailStore(api, account, client_for(account))
+        return stores[key]
+
+    tools_gmail.register(
+        api,
+        accounts=auth.gmail_accounts,
+        client_for=client_for,
+        store_for=store_for,
+        importer=gdrive_import_to_uefn,
+    )
+    nodes.register(api)
+
+    shutdown()  # a reinstall registers again: never two pollers
+    _POLLER = poller.Poller(api, accounts=auth.gmail_accounts, store_for=store_for, interval=_poll_seconds)
+    _POLLER.start()
+
+    api.log("Google Workspace tools registered")

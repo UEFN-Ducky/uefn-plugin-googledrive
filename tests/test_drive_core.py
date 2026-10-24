@@ -1,4 +1,4 @@
-"""Backend split: auth.py + drive.py behind register(api) — 8 gdrive_* tools, 2 nodes, same behavior."""
+"""register(api): auth.py + drive.py tools, every Gmail / Drive / account module, nodes and the poller."""
 
 from __future__ import annotations
 
@@ -19,10 +19,7 @@ _spec.loader.exec_module(gd)
 auth = sys.modules["gd_core_backend.auth"]
 drive = sys.modules["gd_core_backend.drive"]
 
-TOOLS = {
-    "gdrive_status",
-    "gdrive_connect",
-    "gdrive_disconnect",
+OWN_TOOLS = {
     "gdrive_list",
     "gdrive_search",
     "gdrive_file_info",
@@ -31,6 +28,30 @@ TOOLS = {
     "google_open",
     "google_open_pending",
 }
+MODULE_TOOLS = (
+    set(gd.tools_account.TOOL_NAMES)
+    | set(gd.tools_account.ALIAS_NAMES)
+    | set(gd.tools_drive.TOOL_NAMES)
+    | set(gd.tools_gmail.TOOL_NAMES)
+)
+GMAIL_NODES = {f"googledrive.{n}" for n in gd.nodes.NODE_METHODS}
+
+
+class FakeData:
+    def __init__(self) -> None:
+        self.docs: dict[str, object] = {}
+
+    def get(self, key, default=None):
+        return self.docs.get(key, default)
+
+    def put(self, key, value, **_kw):
+        self.docs[key] = value
+
+    def delete(self, key, **_kw):
+        self.docs.pop(key, None)
+
+    def items(self, prefix=""):
+        return {k: v for k, v in self.docs.items() if k.startswith(prefix)}
 
 
 class FakeApi:
@@ -38,10 +59,16 @@ class FakeApi:
         self.tools: dict[str, dict] = {}
         self.nodes: dict[str, object] = {}
         self.rpcs: dict[str, object] = {}
+        self.duplicates: list[str] = []
+        self.data = FakeData()
+        self.search = None
 
     def tool(self, fn=None, *, name=None, intent=None, listener=True):
         def deco(f):
-            self.tools[name or f.__name__] = {"fn": f, "listener": listener}
+            key = name or f.__name__
+            if key in self.tools:
+                self.duplicates.append(key)
+            self.tools[key] = {"fn": f, "listener": listener}
             return f
 
         return deco(fn) if fn else deco
@@ -59,8 +86,20 @@ class FakeApi:
     def call_tool(self, name, arguments=None):
         raise RuntimeError("no panel open")
 
+    def http_json(self, *a, **k):
+        raise AssertionError("no Gmail request expected")
+
     def listener(self, *a, **k):
         raise RuntimeError("listener offline")
+
+    def is_enabled(self) -> bool:
+        return False  # the poller stays paused in tests
+
+    def emit_automation(self, *a, **k):
+        return {}
+
+    def changeset(self, *a, **k):
+        return None
 
     def log(self, msg: str) -> None:
         pass
@@ -77,19 +116,32 @@ def api(monkeypatch, tmp_path):
     fake = FakeApi()
     fake.secrets = secrets
     gd.register(fake)
-    return fake
+    yield fake
+    gd.shutdown()
+    auth.bind(None)
 
 
 def _call(api, name, **kw):
-    return json.loads(api.tools[name]["fn"](**kw))
+    out = api.tools[name]["fn"](**kw)
+    return json.loads(out) if isinstance(out, str) else out
 
 
-def test_register_keeps_tools_and_nodes(api):
-    assert set(api.tools) == TOOLS
+def test_register_wires_every_module(api):
+    assert api.duplicates == []
+    assert set(api.tools) == OWN_TOOLS | MODULE_TOOLS
+    assert len(api.tools) >= 30
     # Only the import tool talks to the UEFN editor.
     assert [n for n, t in api.tools.items() if t["listener"]] == ["gdrive_import_to_uefn"]
-    assert set(api.nodes) == {"googledrive.list", "googledrive.download"}
-    assert "google_open_pending" in api.rpcs
+    assert set(api.nodes) == {"googledrive.list", "googledrive.download"} | GMAIL_NODES
+    assert {"google_open_pending", "google_status", "gmail_list", "gdrive_move"} <= set(api.rpcs)
+
+
+def test_poller_runs_once_and_restarts_cleanly(api):
+    first = gd._POLLER
+    assert first is not None and first._thread is not None and first._thread.is_alive()
+    gd.register(FakeApi())  # a reinstall: the old poller stops, one new poller runs
+    assert gd._POLLER is not first and first._thread is None
+    assert first.poll_once() == {"paused": True, "emitted": 0}
 
 
 def test_google_open_gives_link_without_panel(api):
@@ -106,20 +158,22 @@ def test_modules_own_their_parts():
     assert auth._host_ok("oauth2.googleapis.com") and not auth._host_ok("evil.com")
 
 
-def test_status_signed_out(api):
-    out = _call(api, "gdrive_status")
-    assert out["ok"], out
-    assert out["connected"] is False
-    # No own client and no Google Connect client id in this build yet.
-    assert out["sign_in_kind"] == "none" and out["sign_in_ready"] is False
-    assert out["access_modes"] == ["public"]
+def test_status_signed_out_has_drive_details(api, tmp_path):
+    for name in ("google_status", "gdrive_status"):
+        out = _call(api, name)
+        assert out["ok"], out
+        assert out["count"] == 0 and out["sign_in_ready"] is False
+        # No own client and no Google Connect client id in this build yet.
+        assert out["sign_in_kind"] == "none"
+        assert out["access_modes"] == ["public"] and out["staging_dir"] == str(tmp_path)
 
 
-def test_disconnect_erases_token_without_network(api):
-    api.secrets[auth.KEY_TOKEN] = json.dumps({"access_token": "a", "refresh_token": "r"})
-    out = _call(api, "gdrive_disconnect", revoke=False)
-    assert out["ok"] and out["revoked_at_google"] is False
-    assert api.secrets[auth.KEY_TOKEN] == ""
+def test_accounts_come_from_auth(api):
+    api.secrets[auth.KEY_TOKEN] = json.dumps({"access_token": "a", "refresh_token": "r", "email": "me@example.com"})
+    rows = _call(api, "google_accounts_list")["accounts"]
+    assert [r["email"] for r in rows] == ["me@example.com"]
+    assert rows[0]["gmail"] is False and "access_token" not in rows[0]
+    assert _call(api, "gmail_list")["ok"] is False  # Gmail is off for that account
 
 
 def test_list_needs_access(api):

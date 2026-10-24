@@ -10,6 +10,8 @@ agent run the same code.
   - Write: drafts, send, reply, forward. Sending tools are ``destructive_tools`` in
     plugin.json, so Ducky asks the person before each call; every write is recorded
     in the Changes ledger (a sent mail can't be unsent, so those are manual).
+  - Attachment → UEFN: saves the attachment, then runs Drive's import pipeline
+    (``gdrive_import_to_uefn`` with ``local_path``) so the same checks apply.
   - Accounts: every tool takes an optional ``account`` (email). Empty: reads cover every
     connected account, merged newest first and tagged with their account; writes refuse
     when several are connected, so nothing goes out from the wrong address.
@@ -27,6 +29,7 @@ from __future__ import annotations
 
 import functools
 import importlib.util
+import json
 import re
 import sys
 from email.utils import formataddr
@@ -57,6 +60,10 @@ DEFAULT_MAX = 20
 LIST_MAX = 100
 ATTACHMENT_MAX_BYTES = 25 * 1024 * 1024  # Gmail's own attachment limit
 MODIFY_MAX = 500
+# drive.ALLOWED_EXTS (models, textures, audio, zip): checked before anything is downloaded;
+# gdrive_import_to_uefn checks again and picks what UEFN can take.
+IMPORT_EXTS = frozenset({".fbx", ".glb", ".gltf", ".obj", ".bin", ".mtl", ".png", ".jpg", ".jpeg", ".tga",
+                         ".psd", ".tif", ".tiff", ".exr", ".hdr", ".bmp", ".wav", ".mp3", ".ogg", ".flac", ".zip"})
 METADATA_HEADERS = ("From", "To", "Cc", "Subject", "Date")
 SYSTEM_LABELS = frozenset(
     {"INBOX", "UNREAD", "STARRED", "IMPORTANT", "SENT", "DRAFT", "SPAM", "TRASH", "CHAT"}
@@ -170,12 +177,14 @@ class GmailTools:
         accounts: AccountsFn,
         client_for: ClientFn,
         store_for: Callable[[str], Any] | None = None,
+        importer: Callable[..., Any] | None = None,
         max_attachment_bytes: int = ATTACHMENT_MAX_BYTES,
     ) -> None:
         self.api = api
         self._accounts_fn = accounts
         self._client_for = client_for
         self._store_for = store_for
+        self._importer = importer
         self.max_attachment_bytes = int(max_attachment_bytes)
 
     # ── accounts ──────────────────────────────────────────────────────────
@@ -480,6 +489,9 @@ class GmailTools:
         """Save one attachment under ``api.local_dir`` → (path, attachment row, account)."""
         acct, c, msg = self._locate(id, account)
         att = self._attachment(msg, _str(attachment_id), _str(filename))
+        return self._save_attachment(c, msg, att, id), att, acct
+
+    def _save_attachment(self, c: Any, msg: dict[str, Any], att: dict[str, Any], id: str) -> Path:
         cap = self.max_attachment_bytes
         if att["size"] > cap:
             raise ToolError(f"{att['filename']} is {att['size']} bytes, over the {cap}-byte limit.")
@@ -492,7 +504,7 @@ class GmailTools:
         tmp = path.with_name(path.name + ".part")
         tmp.write_bytes(data)
         tmp.replace(path)
-        return path, att, acct
+        return path
 
     def gmail_attachment_download(self, id: str, attachment_id: str = "", filename: str = "",
                                   account: str = "") -> dict[str, Any]:
@@ -504,6 +516,46 @@ class GmailTools:
         path, att, acct = self.download_attachment(id, attachment_id, filename, account)
         return {"ok": True, "path": str(path), "filename": path.name, "mimeType": att["mimeType"],
                 "size": path.stat().st_size, "account": acct}
+
+    def _import(self, **params: Any) -> dict[str, Any]:
+        """Drive's import pipeline (``gdrive_import_to_uefn`` with ``local_path``)."""
+        if self._importer is not None:
+            out = self._importer(**params)
+        else:
+            out = self.api.call_tool("gdrive_import_to_uefn", params)
+        if isinstance(out, str):
+            try:
+                out = json.loads(out)
+            except ValueError:
+                out = {"ok": False, "error": out}
+        return out if isinstance(out, dict) else {"ok": False, "error": "the import returned no result"}
+
+    def gmail_attachment_import_to_uefn(self, id: str, attachment_id: str = "", filename: str = "",
+                                        destination_path: str = "", replace_existing: bool = True,
+                                        account: str = "") -> dict[str, Any]:
+        """Import an email attachment into UEFN as a real asset (model, texture, .wav, or a zip of them).
+
+        id: the message id; attachment_id or filename picks the attachment. destination_path:
+        a project content path (/MyProject/Models) or relative (Imported/Props). Uses the
+        same pipeline as gdrive_import_to_uefn: type allowlist, size caps, safe zip
+        extraction, staging, import_asset. Needs UEFN open with the Ducky listener.
+        """
+        acct, c, msg = self._locate(id, account)
+        att = self._attachment(msg, _str(attachment_id), _str(filename))
+        ext = Path(att["filename"]).suffix.lower()
+        if ext not in IMPORT_EXTS:
+            raise ToolError(
+                f"{att['filename']} can't be imported into UEFN: only models (.fbx .glb .gltf .obj), "
+                "textures, audio and .zip files are. Nothing was downloaded."
+            )
+        path = self._save_attachment(c, msg, att, id)
+        res = self._import(local_path=str(path), destination_path=_str(destination_path),
+                           replace_existing=bool(replace_existing))
+        out = dict(res)
+        out.setdefault("ok", not res.get("error"))
+        out["attachment"] = {"filename": att["filename"], "path": str(path), "size": path.stat().st_size,
+                             "message_id": msg.get("id") or id, "account": acct}
+        return out
 
     # ── write ─────────────────────────────────────────────────────────────
 
@@ -861,6 +913,7 @@ READ_TOOLS = (
     "gmail_find",
     "gmail_attachment_download",
     "gmail_draft_list",
+    "gmail_attachment_import_to_uefn",
 )
 WRITE_TOOLS = (
     "gmail_draft_create",

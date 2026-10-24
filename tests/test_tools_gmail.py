@@ -602,6 +602,66 @@ def test_no_account_with_gmail_on_says_so(tmp_path):
         tools.gmail_list()
 
 
+# ── attachment → UEFN ──────────────────────────────────────────────────────
+
+
+def mail_with_files():
+    client = FakeGmail(messages=[gmail_message("m2", subject="Logo", attachments=[
+        ("logo.png", "image/png", 4), ("run.exe", "application/octet-stream", 3), ("crate.fbx", "application/octet-stream", 5),
+    ])])
+    client.attachments.update({"att-m2-1": b"\x89PNG", "att-m2-2": b"MZ!", "att-m2-3": b"FBX01"})
+    return client
+
+
+def test_import_saves_the_attachment_and_hands_it_to_the_drive_pipeline(tmp_path):
+    calls = []
+
+    def importer(**params):
+        calls.append(params)
+        return {"ok": True, "imported": 1, "attempted": 1, "destination_path": params["destination_path"]}
+
+    tools, _ = make(mail_with_files(), tmp_path=tmp_path, importer=importer)
+    out = tools.gmail_attachment_import_to_uefn("m2", filename="crate.fbx", destination_path="Imported/Props")
+    assert out["ok"] and out["imported"] == 1
+    saved = Path(calls[0]["local_path"])
+    assert saved.read_bytes() == b"FBX01" and saved.is_relative_to(tmp_path)
+    assert calls[0]["destination_path"] == "Imported/Props" and calls[0]["replace_existing"] is True
+    assert out["attachment"]["filename"] == "crate.fbx" and out["attachment"]["account"] == ME
+
+
+def test_import_refuses_a_non_asset_before_downloading(tmp_path):
+    calls = []
+    tools, _ = make(mail_with_files(), tmp_path=tmp_path, importer=lambda **p: calls.append(p))
+    with pytest.raises(tg.ToolError, match="can't be imported"):
+        tools.gmail_attachment_import_to_uefn("m2", filename="run.exe")
+    assert calls == [] and not list(Path(tmp_path).rglob("run.exe"))
+
+
+def test_import_defaults_to_gdrive_import_to_uefn_via_call_tool(tmp_path):
+    client = mail_with_files()
+    api = FakeApi(tmp_path)
+
+    def call_tool(name, args):
+        api.tool_calls.append((name, args))
+        return '{"ok": false, "imported": 0, "error": "UEFN listener appears offline"}'
+
+    api.call_tool = call_tool
+    tg.register(api, accounts=lambda: [ME], client_for=lambda a: client)
+    out = api.tools["gmail_attachment_import_to_uefn"](id="m2", filename="logo.png")
+    assert api.tool_calls[0][0] == "gdrive_import_to_uefn"
+    assert Path(api.tool_calls[0][1]["local_path"]).name == "logo.png"
+    assert out["ok"] is False and "offline" in out["error"] and out["attachment"]["filename"] == "logo.png"
+
+
+def test_import_finds_the_mail_in_the_right_account(tmp_path):
+    home = FakeGmail(ME)
+    work = mail_with_files()
+    work.email = WORK
+    tools, _ = make(home, work, tmp_path=tmp_path, importer=lambda **p: {"ok": True, "imported": 1})
+    out = tools.gmail_attachment_import_to_uefn("m2", filename="logo.png")
+    assert out["attachment"]["account"] == WORK
+
+
 def test_safe_filename_strips_paths_and_reserved_names():
     assert tg.safe_filename("../../evil/con.txt") == "_con.txt"
     assert tg.safe_filename('a<b>:"c.png') == "a_b___c.png"

@@ -116,6 +116,35 @@ def test_walkthrough_targets_google_tab():
     assert "google-drive" not in json.dumps(walk)
 
 
+SKILL = (ROOT / "skills" / "googledrive" / "SKILL.md").read_text(encoding="utf-8")
+
+
+def test_skill_frontmatter_is_findable():
+    front = SKILL.split("---")[1]
+    desc = next(line for line in front.splitlines() if line.startswith("description:"))
+    assert len(desc) > 60 and ">" not in desc.split(":", 1)[1][:3]
+    assert "gmail" in desc.lower() and "drive" in desc.lower()
+    assert "keywords:" in front and "inbox" in front
+
+
+def test_skill_hard_rules_come_first():
+    body = SKILL.split("---", 2)[2]
+    head = body[: body.index("\n## ")]
+    assert "untrusted" in head
+    assert "Never send without asking" in head
+    assert "No delete" in head and "confirmed=true" in head
+
+
+def test_skill_names_every_tool_and_node():
+    for name in TOOLS["tools"]:
+        assert f"`{name}" in SKILL, name
+    for node in CONTRIB["automations"]["nodes"]:
+        assert node["id"] in SKILL, node["id"]
+    assert "gmail.received" in SKILL
+    sections = [line for line in SKILL.splitlines() if line.startswith("## ")]
+    assert len(sections) >= 7
+
+
 def test_no_secret_values_in_manifest():
     text = (ROOT / "plugin.json").read_text(encoding="utf-8")
     assert not re.search(r"GOCSPX-[A-Za-z0-9_-]{10,}", text)

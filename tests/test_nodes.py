@@ -160,6 +160,70 @@ def test_trash_with_allow_trash_confirms_through_the_tool():
     assert out["ok"] and tools.calls[-1][0] == "gmail_trash"
 
 
+def _template(tid: str) -> dict:
+    return next(t for t in AUTOMATIONS["templates"] if t["id"] == tid)
+
+
+def _check_graph(graph: dict) -> None:
+    """One straight line of main edges from the start to pipeline.finish; data pins exist."""
+    by_id = {n["id"]: n for n in graph["nodes"]}
+    declared = {n["id"]: n for n in AUTOMATIONS["nodes"]}
+    main = [e for e in graph["edges"] if e["kind"] == "main"]
+    nxt = {e["source"]: e["target"] for e in main}
+    assert len(nxt) == len(main), "branching main edges"
+    starts = set(by_id) - {e["target"] for e in main}
+    assert len(starts) == 1
+    seen, cur = [], starts.pop()
+    while cur:
+        seen.append(cur)
+        cur = nxt.get(cur)
+    assert seen == [n["id"] for n in graph["nodes"]]
+    assert by_id[seen[-1]]["type"] == "pipeline.finish"
+    for e in graph["edges"]:
+        if e["kind"] != "data":
+            continue
+        src, dst = by_id[e["source"]]["type"], by_id[e["target"]]["type"]
+        if src in declared:
+            assert e["source_pin"] in {p["id"] for p in declared[src].get("outputs", [])}, e
+        if dst in declared:
+            assert e["target_pin"] in {p["id"] for p in declared[dst].get("inputs", [])}, e
+        if dst == "pipeline.agent":
+            assert e["target_pin"] == "context"
+
+
+def test_inbox_digest_template_reads_only():
+    t = _template("googledrive-inbox-digest")
+    _check_graph(t["graph"])
+    types = [n["type"] for n in t["graph"]["nodes"]]
+    assert types == ["start.cron", "googledrive.gmail_search", "pipeline.agent", "pipeline.finish"]
+    assert t["graph"]["nodes"][0]["config"]["cron"] == "0 8 * * *"
+    prompt = t["graph"]["nodes"][2]["config"]["prompt"]
+    assert "untrusted" in prompt and "never send" in prompt
+
+
+def test_draft_replies_template_never_sends():
+    t = _template("googledrive-draft-replies")
+    _check_graph(t["graph"])
+    types = [n["type"] for n in t["graph"]["nodes"]]
+    assert types == ["gmail.received", "googledrive.gmail_get", "pipeline.agent", "googledrive.gmail_draft",
+                     "pipeline.finish"]
+    assert not any(x in types for x in ("googledrive.gmail_send", "googledrive.gmail_trash", "googledrive.gmail_modify"))
+    assert "untrusted" in t["graph"]["nodes"][2]["config"]["prompt"]
+
+
+def test_draft_replies_template_runs_end_to_end_with_fakes():
+    """Trigger payload → get → (agent text) → draft in the same thread; no send call."""
+    n, tools = make({
+        "gmail_get": {"ok": True, "message": {"id": "m7", "threadId": "t7", "subject": "Build?", "text": "Ship tonight?"}},
+        "gmail_draft_create": {"ok": True, "draft": {"id": "d7"}},
+    })
+    got = n.get({"payload": {"account": "me@example.com", "id": "m7", "from": "sam@example.com", "subject": "Build?"}})
+    out = n.draft({"inputs": {"reply_to": got["message"], "body": "Yes, after 8."}})
+    assert out["draft_id"] == "d7"
+    assert tools.names == ["gmail_get", "gmail_draft_create"]
+    assert tools.calls[1][1]["reply_to_id"] == "m7"
+
+
 @pytest.mark.parametrize("method", ["list", "search", "get", "draft", "send", "modify"])
 def test_tool_errors_stop_the_run_with_a_message(method):
     tool = {"list": "gmail_list", "search": "gmail_search", "get": "gmail_get", "draft": "gmail_draft_create",

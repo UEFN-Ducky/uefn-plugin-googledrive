@@ -30,7 +30,9 @@ from __future__ import annotations
 import functools
 import importlib.util
 import json
+import mimetypes
 import re
+import stat
 import sys
 from email.utils import formataddr
 from pathlib import Path
@@ -136,6 +138,48 @@ def safe_filename(name: str) -> str:
     if stem.lower() in _RESERVED:
         stem = "_" + stem
     return (stem[:120] or "attachment") + (f".{ext[:16]}" if ext else "")
+
+
+def _mb(n: int) -> str:
+    return f"{n / (1024 * 1024):.1f} MB"
+
+
+def load_attachments(paths: Any, *, limit: int = ATTACHMENT_MAX_BYTES, already: int = 0) -> list[dict[str, Any]]:
+    """Local files → ``[{filename, data, mimeType}]`` for ``mime.build_*``.
+
+    ``paths``: a list of paths (or one path). Only regular files; the total, plus
+    ``already`` (bytes carried from the original on a forward), stays within ``limit``.
+    Raises ToolError with the file at fault.
+    """
+    if paths is None or paths == "":
+        return []
+    items = [paths] if isinstance(paths, (str, Path)) else list(paths)
+    picked: list[tuple[Path, int]] = []
+    total = already
+    for raw in items:
+        text = _str(raw)
+        if not text:
+            continue
+        path = Path(text).expanduser()
+        try:
+            info = path.stat()
+        except OSError:
+            raise ToolError(f"Attachment not found: {text}. Nothing was sent.") from None
+        if not stat.S_ISREG(info.st_mode):
+            raise ToolError(f"Attachment is not a file: {text}. Only regular files can be attached.")
+        total += info.st_size
+        picked.append((path, info.st_size))
+    if total > limit:
+        raise ToolError(
+            f"Attachments total {_mb(total)}, over Gmail's {_mb(limit)} limit. Nothing was sent: "
+            "attach fewer files, or share big ones from Drive."
+        )
+    out = []
+    for path, _size in picked:
+        guessed, _enc = mimetypes.guess_type(path.name)
+        out.append({"filename": path.name, "data": path.read_bytes(),
+                    "mimeType": guessed or "application/octet-stream"})
+    return out
 
 
 def row(msg: dict[str, Any], account: str = "") -> dict[str, Any]:
@@ -604,13 +648,16 @@ class GmailTools:
             raise
 
     def _compose(self, client: Any, account: str, *, to: Any, subject: str, body: str, cc: Any, bcc: Any,
-                 html: str, reply_to_id: str = "") -> tuple[bytes, str, str]:
+                 html: str, reply_to_id: str = "", attachments: Any = None) -> tuple[bytes, str, str]:
         """(raw, threadId, subject) for a new mail, or a reply when ``reply_to_id`` is set."""
+        files = load_attachments(attachments, limit=self.max_attachment_bytes)
         if _str(reply_to_id):
             original = self._original(client, _str(reply_to_id))
-            built = mime.build_reply(original, text=body, html=html, self_email=account, sender=account)
+            built = mime.build_reply(original, text=body, html=html, self_email=account, sender=account,
+                                     attachments=files)
             return built["raw"], built["threadId"], mime.reply_subject(original.get("subject", ""))
-        raw = mime.build_message(to=to, cc=cc, bcc=bcc, subject=subject, text=body, html=html, sender=account)
+        raw = mime.build_message(to=to, cc=cc, bcc=bcc, subject=subject, text=body, html=html, sender=account,
+                                 attachments=files)
         return raw, "", subject
 
     def _sent(self, command: str, account: str, res: dict[str, Any], subject: str, to: str) -> dict[str, Any]:
@@ -622,17 +669,19 @@ class GmailTools:
                 "message": f"Sent “{subject or '(no subject)'}”" + (f" to {to}." if to else ".")}
 
     def gmail_draft_create(self, to: str = "", subject: str = "", body: str = "", cc: str = "", bcc: str = "",
-                           html: str = "", reply_to_id: str = "", account: str = "") -> dict[str, Any]:
+                           html: str = "", reply_to_id: str = "", attachments: list[str] | None = None,
+                           account: str = "") -> dict[str, Any]:
         """Save a Gmail draft. Never sends.
 
         reply_to_id: a message id to draft a reply to (threaded, To filled from it).
-        to / cc / bcc: comma-separated addresses. account: the sending account; needed when
-        several are connected. Returns {ok, draft: {id, message_id, threadId}, draft_id}.
+        to / cc / bcc: comma-separated addresses. attachments: local file paths (25 MB in
+        all). account: the sending account; needed when several are connected.
+        Returns {ok, draft: {id, message_id, threadId}, draft_id}.
         """
         acct = self.write_account(account)
         c = self.client(acct)
         raw, thread_id, subj = self._compose(c, acct, to=to, subject=subject, body=body, cc=cc, bcc=bcc,
-                                             html=html, reply_to_id=reply_to_id)
+                                             html=html, reply_to_id=reply_to_id, attachments=attachments)
         res = c.create_draft(raw, thread_id) or {}
         draft = {"id": _str(res.get("id")), "message_id": _str((res.get("message") or {}).get("id")),
                  "threadId": _str((res.get("message") or {}).get("threadId")) or thread_id}
@@ -642,8 +691,13 @@ class GmailTools:
         return {"ok": True, "draft": draft, "draft_id": draft["id"], "account": acct}
 
     def gmail_draft_update(self, draft_id: str, to: str = "", subject: str = "", body: str = "", cc: str = "",
-                           bcc: str = "", html: str = "", account: str = "") -> dict[str, Any]:
-        """Change a draft. Fields left empty keep the draft's current value; reply threading is kept."""
+                           bcc: str = "", html: str = "", attachments: list[str] | None = None,
+                           account: str = "") -> dict[str, Any]:
+        """Change a draft. Fields left empty keep the draft's current value; reply threading is kept.
+
+        attachments: local file paths that replace the draft's files ([] removes them); leave
+        it out to keep the files the draft already has. 25 MB in all.
+        """
         acct = self.write_account(account)
         c = self.client(acct)
         did = _str(draft_id)
@@ -653,6 +707,12 @@ class GmailTools:
         old = mime.parse_message(current.get("message") or {})
         thread_id = _str((current.get("message") or {}).get("threadId"))
         subj = subject or old.get("subject", "")
+        if attachments is None:
+            files = self._carried(c, old)
+            if sum(len(f["data"]) for f in files) > self.max_attachment_bytes:
+                raise ToolError(f"The draft's attachments are over Gmail's {_mb(self.max_attachment_bytes)} limit.")
+        else:
+            files = load_attachments(attachments, limit=self.max_attachment_bytes)
         raw = mime.build_message(
             to=to or old.get("to"),
             cc=cc or old.get("cc"),
@@ -663,6 +723,7 @@ class GmailTools:
             sender=acct,
             in_reply_to=old.get("in_reply_to", ""),
             references=old.get("references", ""),
+            attachments=files,
         )
         res = c.update_draft(did, raw, thread_id) or {}
         self.record(command="gmail_draft_update", kind="draft", ident=did, account=acct,
@@ -702,46 +763,61 @@ class GmailTools:
                           ", ".join(_address(a) for a in old.get("to") or []))
 
     def gmail_send(self, to: str, subject: str, body: str, cc: str = "", bcc: str = "", html: str = "",
-                   account: str = "") -> dict[str, Any]:
+                   attachments: list[str] | None = None, account: str = "") -> dict[str, Any]:
         """Send a new email. Ducky asks the person first.
 
         to / cc / bcc: comma-separated addresses. html: optional HTML body (body stays the
-        plain-text part). account: the sending account; needed when several are connected.
+        plain-text part). attachments: local file paths (25 MB in all). account: the
+        sending account; needed when several are connected.
         """
         acct = self.write_account(account)
         c = self.client(acct)
-        raw, _thread, subj = self._compose(c, acct, to=to, subject=subject, body=body, cc=cc, bcc=bcc, html=html)
+        raw, _thread, subj = self._compose(c, acct, to=to, subject=subject, body=body, cc=cc, bcc=bcc, html=html,
+                                           attachments=attachments)
         return self._sent("gmail_send", acct, c.send_raw(raw) or {}, subj, _str(to))
 
     def gmail_reply(self, id: str, body: str, reply_all: bool = False, html: str = "",
-                    account: str = "") -> dict[str, Any]:
+                    attachments: list[str] | None = None, account: str = "") -> dict[str, Any]:
         """Reply to an email in its thread (quotes the original). Ducky asks the person first.
 
-        reply_all: also send to the original To and Cc (minus you).
+        reply_all: also send to the original To and Cc (minus you). attachments: local file
+        paths (25 MB in all).
         """
         acct = self.write_account(account)
         c = self.client(acct)
+        files = load_attachments(attachments, limit=self.max_attachment_bytes)
         original = self._original(c, _str(id))
-        built = mime.build_reply(original, text=body, html=html, reply_all=bool(reply_all), self_email=acct, sender=acct)
+        built = mime.build_reply(original, text=body, html=html, reply_all=bool(reply_all), self_email=acct, sender=acct,
+                                 attachments=files)
         res = c.send_raw(built["raw"], built["threadId"]) or {}
         to = ", ".join(_address(a) for a in built["to"] + built["cc"])
         return self._sent("gmail_reply", acct, res, mime.reply_subject(original.get("subject", "")), to)
 
+    def _carried(self, client: Any, parsed: dict[str, Any]) -> list[dict[str, Any]]:
+        """The attachments of a parsed message, fetched as ``[{filename, data, mimeType}]``."""
+        files = []
+        for att in parsed.get("attachments") or []:
+            if att.get("attachmentId") and parsed.get("id"):
+                data = client.get_attachment(parsed["id"], att["attachmentId"])["data"]
+                files.append({"filename": att["filename"], "data": data, "mimeType": att["mimeType"]})
+        return files
+
     def gmail_forward(self, id: str, to: str, body: str = "", cc: str = "", include_attachments: bool = True,
-                      account: str = "") -> dict[str, Any]:
-        """Forward an email with its attachments. Ducky asks the person first."""
+                      attachments: list[str] | None = None, account: str = "") -> dict[str, Any]:
+        """Forward an email with its attachments. Ducky asks the person first.
+
+        attachments: extra local file paths to add; with the original's files they stay
+        within Gmail's 25 MB.
+        """
         acct = self.write_account(account)
         c = self.client(acct)
         raw_msg = c.get_message(_str(id), "full") if _str(id) else None
         if not raw_msg:
             raise ToolError("id is required")
         original = mime.parse_message(raw_msg)
-        files = []
-        if include_attachments:
-            for att in original.get("attachments") or []:
-                if att.get("attachmentId"):
-                    data = c.get_attachment(original["id"], att["attachmentId"])["data"]
-                    files.append({"filename": att["filename"], "data": data, "mimeType": att["mimeType"]})
+        files = self._carried(c, original) if include_attachments else []
+        files += load_attachments(attachments, limit=self.max_attachment_bytes,
+                                  already=sum(len(f["data"]) for f in files))
         built = mime.build_forward(original, to=to, text=body, cc=cc or None, attachments=files, sender=acct)
         res = c.send_raw(built["raw"], built["threadId"]) or {}
         return self._sent("gmail_forward", acct, res, mime.forward_subject(original.get("subject", "")), _str(to))

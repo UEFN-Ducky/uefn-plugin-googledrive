@@ -121,16 +121,22 @@ class FakeGmail:
         parsed = tg.mime.parse_raw(raw)
         headers = [{"name": k, "value": v} for k, v in parsed["headers"].items()]
         parts = [{"mimeType": "text/plain", "body": {"data": b64(parsed["text"])}}]
+        for i, att in enumerate(parsed["attachments"], 1):
+            aid = f"att-dm-{did}-{next(self._ids)}"
+            self.attachments[aid] = att["data"]
+            parts.append({"partId": str(i), "mimeType": att["mimeType"], "filename": att["filename"],
+                          "headers": [{"name": "Content-Disposition", "value": "attachment"}],
+                          "body": {"attachmentId": aid, "size": att["size"]}})
         return {"id": f"dm-{did}", "threadId": thread_id or f"t-{did}", "labelIds": ["DRAFT"],
-                "internalDate": "1", "payload": {"mimeType": "multipart/alternative", "headers": headers, "parts": parts}}
+                "internalDate": "1", "payload": {"mimeType": "multipart/mixed", "headers": headers, "parts": parts}}
 
     def create_draft(self, raw, thread_id=""):
         did = f"d{next(self._ids)}"
-        self.drafts[did] = {"id": did, "message": self._draft_message(did, raw, thread_id)}
+        self.drafts[did] = {"id": did, "raw": raw, "message": self._draft_message(did, raw, thread_id)}
         return self.drafts[did]
 
     def update_draft(self, did, raw, thread_id=""):
-        self.drafts[did] = {"id": did, "message": self._draft_message(did, raw, thread_id)}
+        self.drafts[did] = {"id": did, "raw": raw, "message": self._draft_message(did, raw, thread_id)}
         return self.drafts[did]
 
     def get_draft(self, did, format="full"):
@@ -660,6 +666,102 @@ def test_import_finds_the_mail_in_the_right_account(tmp_path):
     tools, _ = make(home, work, tmp_path=tmp_path, importer=lambda **p: {"ok": True, "imported": 1})
     out = tools.gmail_attachment_import_to_uefn("m2", filename="logo.png")
     assert out["attachment"]["account"] == WORK
+
+
+# ── attachments on send, reply, forward, drafts ────────────────────────────
+
+PNG = b"\x89PNG\r\n\x1a\nfake"
+
+
+def a_png(tmp_path, name="a.png", data=PNG):
+    path = Path(tmp_path) / "files" / name
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(data)
+    return str(path)
+
+
+def parts(raw):
+    return [(a["filename"], a["mimeType"], a["data"]) for a in tg.mime.parse_raw(raw)["attachments"]]
+
+
+def test_send_attaches_a_local_file_with_its_mime_type(tmp_path):
+    client = FakeGmail()
+    tools, _ = make(client, tmp_path=tmp_path)
+    out = tools.gmail_send("ana@example.com", "Logo", "Here it is", attachments=[a_png(tmp_path)])
+    assert out["sent"] and parts(client.sent[-1]["raw"]) == [("a.png", "image/png", PNG)]
+
+
+def test_panel_rpc_takes_attachments_like_the_tool(tmp_path):
+    api = FakeApi(tmp_path)
+    client = FakeGmail()
+    tg.register(api, accounts=lambda: [ME], client_for=lambda a: client)
+    out = api.rpcs["gmail_send"](to="ana@example.com", subject="Logo", body="Hi", attachments=[a_png(tmp_path)])
+    assert out["ok"] and parts(client.sent[-1]["raw"])[0][:2] == ("a.png", "image/png")
+
+
+def test_draft_carries_attachments_and_update_keeps_or_replaces_them(tmp_path):
+    client = FakeGmail()
+    tools, _ = make(client, tmp_path=tmp_path)
+    did = tools.gmail_draft_create(to="ana@example.com", subject="Logo", body="Draft",
+                                   attachments=[a_png(tmp_path)])["draft_id"]
+    assert client.sent == [] and parts(client.drafts[did]["raw"]) == [("a.png", "image/png", PNG)]
+    tools.gmail_draft_update(did, body="Draft 2")  # attachments left out: kept
+    assert parts(client.drafts[did]["raw"]) == [("a.png", "image/png", PNG)]
+    tools.gmail_draft_update(did, attachments=[a_png(tmp_path, "notes.txt", b"hello")])
+    assert parts(client.drafts[did]["raw"]) == [("notes.txt", "text/plain", b"hello")]
+    tools.gmail_draft_update(did, attachments=[])
+    assert parts(client.drafts[did]["raw"]) == []
+
+
+def test_reply_and_reply_draft_attach_and_stay_in_the_thread(tmp_path):
+    client = FakeGmail(messages=[gmail_message("m1", subject="Build tonight?", thread="t-build")])
+    tools, _ = make(client, tmp_path=tmp_path)
+    tools.gmail_reply("m1", "Log attached", attachments=[a_png(tmp_path, "build.log", b"ok")])
+    assert client.sent[-1]["threadId"] == "t-build"
+    assert parts(client.sent[-1]["raw"])[0][0] == "build.log"
+    did = tools.gmail_draft_create(body="Later", reply_to_id="m1", attachments=[a_png(tmp_path)])["draft_id"]
+    assert parts(client.drafts[did]["raw"])[0][0] == "a.png"
+
+
+def test_forward_adds_files_to_the_originals(tmp_path):
+    client = FakeGmail(messages=[gmail_message("m2", subject="Logo", attachments=[("logo.png", "image/png", 4)])])
+    client.attachments["att-m2-1"] = b"\x89PNG"
+    tools, _ = make(client, tmp_path=tmp_path)
+    tools.gmail_forward("m2", "lee@example.com", attachments=[a_png(tmp_path, "extra.png")])
+    assert [p[0] for p in parts(client.sent[-1]["raw"])] == ["logo.png", "extra.png"]
+
+
+def test_attachments_over_25_mb_are_refused_and_nothing_is_sent(tmp_path):
+    big = Path(tmp_path) / "files" / "huge.zip"
+    big.parent.mkdir(parents=True, exist_ok=True)
+    with open(big, "wb") as f:
+        f.truncate(tg.ATTACHMENT_MAX_BYTES + 1)
+    client = FakeGmail(messages=[gmail_message("m2", attachments=[("logo.png", "image/png", 4)])])
+    client.attachments["att-m2-1"] = b"\x89PNG"
+    tools, _ = make(client, tmp_path=tmp_path)
+    for call in (
+        lambda: tools.gmail_send("ana@example.com", "Big", "x", attachments=[str(big)]),
+        lambda: tools.gmail_draft_create(to="ana@example.com", body="x", attachments=[str(big)]),
+        lambda: tools.gmail_reply("m2", "x", attachments=[str(big)]),
+    ):
+        with pytest.raises(tg.ToolError, match="over Gmail's 25.0 MB limit"):
+            call()
+    assert client.sent == [] and client.drafts == {}
+    # a forward counts the original's files too
+    small, _ = make(client, tmp_path=tmp_path, max_attachment_bytes=len(PNG) + 2)
+    with pytest.raises(tg.ToolError, match="over Gmail's"):
+        small.gmail_forward("m2", "lee@example.com", attachments=[a_png(tmp_path)])
+    assert client.sent == []
+
+
+def test_missing_files_and_folders_are_refused(tmp_path):
+    client = FakeGmail()
+    tools, _ = make(client, tmp_path=tmp_path)
+    with pytest.raises(tg.ToolError, match="Attachment not found"):
+        tools.gmail_send("ana@example.com", "x", "y", attachments=[str(Path(tmp_path) / "nope.png")])
+    with pytest.raises(tg.ToolError, match="not a file"):
+        tools.gmail_send("ana@example.com", "x", "y", attachments=[str(tmp_path)])
+    assert client.sent == []
 
 
 def test_safe_filename_strips_paths_and_reserved_names():

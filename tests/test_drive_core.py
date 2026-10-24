@@ -20,6 +20,7 @@ auth = sys.modules["gd_core_backend.auth"]
 drive = sys.modules["gd_core_backend.drive"]
 
 OWN_TOOLS = {
+    "gdrive_preview",
     "gdrive_list",
     "gdrive_search",
     "gdrive_file_info",
@@ -101,8 +102,59 @@ class FakeApi:
     def changeset(self, *a, **k):
         return None
 
+    def local_dir(self, name: str = "") -> str:
+        path = self.root / name
+        path.mkdir(parents=True, exist_ok=True)
+        return str(path)
+
+    def media_url(self, path: str) -> str:
+        return "http://127.0.0.1:4199/media?path=" + Path(path).name
+
     def log(self, msg: str) -> None:
         pass
+
+
+PNG_ID = "1A2b3C4d5E6f7G8h9I0j"
+DOC_ID = "9Z8y7X6w5V4u3T2s1R0q"
+
+
+class Resp:
+    def __init__(self, body: bytes, headers: dict | None = None) -> None:
+        self.body = body
+        self.headers = headers or {}
+
+    def read(self, n: int = -1) -> bytes:
+        out, self.body = (self.body, b"") if n < 0 else (self.body[:n], self.body[n:])
+        return out
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_a):
+        return False
+
+
+class FakeDrive:
+    """Drive v3 for two accounts: records which bearer token each request carried."""
+
+    FILES = {
+        PNG_ID: {"id": PNG_ID, "name": "duck.png", "mimeType": "image/png", "size": "4"},
+        DOC_ID: {"id": DOC_ID, "name": "notes.fbx", "mimeType": "application/octet-stream", "size": "4"},
+    }
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, str]] = []
+
+    def open(self, url, *, headers=None, data=None, method=None, timeout=60.0):
+        auth._check_url(url)
+        self.calls.append((url, (headers or {}).get("Authorization", "")))
+        path = url.split("/drive/v3/", 1)[1]
+        if path.startswith("files?"):
+            return Resp(json.dumps({"files": [self.FILES[PNG_ID]]}).encode())
+        file_id = path.split("files/", 1)[1].split("?", 1)[0]
+        if "alt=media" in url:
+            return Resp(b"\x89PNG", {"Content-Length": "4"})
+        return Resp(json.dumps(self.FILES[file_id]).encode())
 
 
 @pytest.fixture()
@@ -115,6 +167,7 @@ def api(monkeypatch, tmp_path):
     monkeypatch.setattr(gd, "_staging_dir", lambda: tmp_path)
     fake = FakeApi()
     fake.secrets = secrets
+    fake.root = tmp_path
     gd.register(fake)
     yield fake
     gd.shutdown()
@@ -183,10 +236,52 @@ def test_list_needs_access(api):
     assert node["ok"] is False
 
 
-def test_download_goes_through_drive(api, monkeypatch, tmp_path):
-    monkeypatch.setattr(drive, "_fetch_metadata", lambda fid: ({"id": fid, "name": "duck.fbx", "size": 3}, "oauth", {}))
+def _two_accounts(api, monkeypatch) -> FakeDrive:
+    far = 4102444800  # 2100-01-01: tokens stay fresh, no refresh call
+    accounts = [
+        {"email": e, "scopes": [auth.SCOPE_DRIVE_READ], "access_token": t, "refresh_token": "r", "expires_at": far, "via": "broker"}
+        for e, t in (("a@gmail.com", "tok-a"), ("b@gmail.com", "tok-b"))
+    ]
+    api.secrets[auth.KEY_ACCOUNTS] = json.dumps({"version": 1, "accounts": accounts})
+    fake = FakeDrive()
+    monkeypatch.setattr(auth, "_open", fake.open)
+    return fake
 
-    def fake_stream(file_id, mode, tmp, cap, md5):
+
+def test_list_uses_the_named_accounts_token(api, monkeypatch):
+    google = _two_accounts(api, monkeypatch)
+    out = json.loads(api.rpcs["gdrive_list"](folder="root", account="b@gmail.com"))  # the Drive tab's call
+    assert out["ok"] and out["folder_id"] == "root" and [f["name"] for f in out["files"]] == ["duck.png"]
+    url, bearer = google.calls[-1]
+    assert bearer == "Bearer tok-b" and "%27root%27+in+parents" in url
+    _call(api, "gdrive_list", folder="root")
+    assert google.calls[-1][1] == "Bearer tok-a"  # no account: the first one with Drive
+    info = _call(api, "gdrive_file_info", file=PNG_ID, account="b@gmail.com")
+    assert info["ok"] and info["name"] == "duck.png" and google.calls[-1][1] == "Bearer tok-b"
+    bad = _call(api, "gdrive_list", account="nobody@gmail.com")
+    assert bad["ok"] is False and "No connected Google account" in bad["error"]
+    assert {"gdrive_list", "gdrive_search", "gdrive_file_info", "gdrive_import_to_uefn", "gdrive_preview"} <= set(api.rpcs)
+
+
+def test_preview_returns_a_media_url_for_a_picture(api, monkeypatch, tmp_path):
+    google = _two_accounts(api, monkeypatch)
+    out = json.loads(api.rpcs["gdrive_preview"](file=PNG_ID, account="b@gmail.com"))
+    assert out["ok"], out
+    assert out["url"] == f"http://127.0.0.1:4199/media?path={PNG_ID}.png" and out["mime"] == "image/png"
+    saved = tmp_path / "drive-previews" / f"{PNG_ID}.png"
+    assert saved.read_bytes() == b"\x89PNG"
+    assert all(bearer == "Bearer tok-b" for _u, bearer in google.calls)
+    n = len(google.calls)
+    assert json.loads(api.rpcs["gdrive_preview"](file=PNG_ID, account="b@gmail.com"))["ok"]
+    assert not any("alt=media" in u for u, _b in google.calls[n:])  # cached: no second download
+    refused = _call(api, "gdrive_preview", file=DOC_ID)
+    assert refused["ok"] is False and "pictures only" in refused["error"]
+
+
+def test_download_goes_through_drive(api, monkeypatch, tmp_path):
+    monkeypatch.setattr(drive, "_fetch_metadata", lambda fid, account="": ({"id": fid, "name": "duck.fbx", "size": 3}, "oauth", {}))
+
+    def fake_stream(file_id, mode, tmp, cap, md5, account=""):
         Path(tmp).write_bytes(b"abc")
         return {"bytes": 3, "sha256": "x"}
 

@@ -346,9 +346,14 @@ def _staging_dir() -> Path:
 # --------------------------------------------------------------------------- #
 
 
-def _auth_modes() -> list[str]:
+def _auth_modes(account: str = "") -> list[str]:
+    """Access modes to try, best first. account: a connected Google account's email."""
     modes: list[str] = []
-    if auth._load_token():
+    if account:
+        if not any(a["email"].lower() == account.strip().lower() for a in auth.list_accounts()):
+            raise ValueError(f"No connected Google account matches {account!r}")
+        modes.append("oauth")
+    elif auth._load_token():
         modes.append("oauth")
     if auth._get_secret(KEY_API):
         modes.append("api_key")
@@ -356,11 +361,16 @@ def _auth_modes() -> list[str]:
     return modes
 
 
-def _api_get_json(path_and_query: str, *, mode: str, timeout: float = 30.0) -> dict[str, Any]:
+def _drive_token(account: str = "") -> str:
+    """That account's access token; no account: the first account with Drive access."""
+    return auth.access_token(account.strip()) if account.strip() else auth._access_token()
+
+
+def _api_get_json(path_and_query: str, *, mode: str, timeout: float = 30.0, account: str = "") -> dict[str, Any]:
     url = f"{API_BASE}/{path_and_query.lstrip('/')}"
     headers: dict[str, str] = {}
     if mode == "oauth":
-        token = auth._access_token()
+        token = _drive_token(account)
         if not token:
             raise ValueError("Not connected to Google Drive — run gdrive_connect")
         headers["Authorization"] = f"Bearer {token}"
@@ -382,10 +392,10 @@ def _api_get_json(path_and_query: str, *, mode: str, timeout: float = 30.0) -> d
 _META_FIELDS = "id,name,mimeType,size,modifiedTime,md5Checksum,shortcutDetails"
 
 
-def _fetch_metadata(file_id: str) -> tuple[dict[str, Any] | None, str, dict[str, str]]:
+def _fetch_metadata(file_id: str, account: str = "") -> tuple[dict[str, Any] | None, str, dict[str, str]]:
     """(metadata, mode_used, errors_by_mode). Resolves Drive shortcuts one hop."""
     errors: dict[str, str] = {}
-    for mode in _auth_modes():
+    for mode in _auth_modes(account):
         if mode == "public":
             continue
         try:
@@ -393,6 +403,7 @@ def _fetch_metadata(file_id: str) -> tuple[dict[str, Any] | None, str, dict[str,
                 f"files/{urllib.parse.quote(file_id)}?fields={urllib.parse.quote(_META_FIELDS)}"
                 "&supportsAllDrives=true",
                 mode=mode,
+                account=account,
             )
             if meta.get("mimeType") == SHORTCUT_MIME:
                 target = str(((meta.get("shortcutDetails") or {}).get("targetId")) or "")
@@ -401,6 +412,7 @@ def _fetch_metadata(file_id: str) -> tuple[dict[str, Any] | None, str, dict[str,
                         f"files/{urllib.parse.quote(target)}?fields={urllib.parse.quote(_META_FIELDS)}"
                         "&supportsAllDrives=true",
                         mode=mode,
+                        account=account,
                     )
             return meta, mode, errors
         except urllib.error.HTTPError as exc:
@@ -472,9 +484,11 @@ def _stream_to_file(resp: Any, tmp_path: Path, cap_bytes: int, md5_expect: str =
     return {"bytes": total, "sha256": sha.hexdigest()}
 
 
-def _download_stream(file_id: str, mode: str, tmp_path: Path, cap: int, md5_expect: str) -> dict[str, Any]:
+def _download_stream(
+    file_id: str, mode: str, tmp_path: Path, cap: int, md5_expect: str, account: str = ""
+) -> dict[str, Any]:
     if mode == "oauth":
-        token = auth._access_token()
+        token = _drive_token(account)
         if not token:
             raise ValueError("Not connected — run gdrive_connect")
         url = f"{API_BASE}/files/{urllib.parse.quote(file_id)}?alt=media&supportsAllDrives=true"
@@ -527,11 +541,12 @@ def download_to_staging(
     subfolder: str = "",
     overwrite: bool = False,
     extract_archives: bool = True,
+    account: str = "",
 ) -> dict[str, Any]:
     """Download one Drive file into the staging dir (extracting zips safely)."""
     file_id = extract_drive_id(file_ref)
     cap = _max_download_bytes()
-    meta, meta_mode, meta_errors = _fetch_metadata(file_id)
+    meta, meta_mode, meta_errors = _fetch_metadata(file_id, account)
     if meta:
         _reject_non_binary_meta(meta)
         file_id = str(meta.get("id") or file_id)
@@ -571,9 +586,9 @@ def download_to_staging(
     got: dict[str, Any] | None = None
     used_mode = ""
     try:
-        for mode in _auth_modes():
+        for mode in _auth_modes(account):
             try:
-                got = _download_stream(file_id, mode, tmp, cap, md5_expect)
+                got = _download_stream(file_id, mode, tmp, cap, md5_expect, account)
                 used_mode = mode
                 break
             except urllib.error.HTTPError as exc:
@@ -656,15 +671,20 @@ def list_drive(
     query: str = "",
     page_size: int = 50,
     page_token: str = "",
+    account: str = "",
 ) -> dict[str, Any]:
-    modes = [m for m in _auth_modes() if m != "public"]
+    modes = [m for m in _auth_modes(account) if m != "public"]
     if not modes:
         raise ValueError(
             "Browsing needs an API key (public folders) or gdrive_connect (your Drive). "
             "Without either you can still download a direct share link via gdrive_download."
         )
     # No explicit folder → fall back to the user's configured "your Drive folder".
-    folder_id = extract_drive_id(folder) if folder.strip() else _target_folder_id()
+    folder = folder.strip()
+    if folder.lower() == "root":
+        folder_id = "root"
+    else:
+        folder_id = extract_drive_id(folder) if folder else _target_folder_id()
     q_parts = ["trashed = false"]
     if folder_id:
         q_parts.append(f"'{_q_escape(folder_id)}' in parents")
@@ -690,7 +710,7 @@ def list_drive(
     errors: dict[str, str] = {}
     for mode in modes:
         try:
-            data = _api_get_json("files?" + urllib.parse.urlencode(params), mode=mode)
+            data = _api_get_json("files?" + urllib.parse.urlencode(params), mode=mode, account=account)
             return {
                 "files": _rows_from_files(data.get("files") or []),
                 "next_page_token": str(data.get("nextPageToken") or ""),
@@ -703,3 +723,56 @@ def list_drive(
             errors[mode] = str(exc)
     detail = "; ".join(f"{m}: {e}" for m, e in errors.items())
     raise ValueError(f"Drive listing failed: {detail}")
+
+
+PREVIEW_EXTS = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".gif": "image/gif",
+                ".webp": "image/webp", ".bmp": "image/bmp"}
+PREVIEW_MAX_BYTES = 20 * 1024 * 1024
+
+
+def preview_image(file_ref: str, dest_dir: Path, *, account: str = "") -> dict[str, Any]:
+    """Download one Drive picture (≤ 20 MB) into ``dest_dir`` for the tab to show.
+
+    Images only (png, jpg, gif, webp, bmp). A preview already on disk is reused.
+    Returns {path, name, mime, bytes}.
+    """
+    file_id = extract_drive_id(file_ref)
+    meta, _mode, errors = _fetch_metadata(file_id, account)
+    if not meta:
+        detail = "; ".join(f"{m}: {e}" for m, e in errors.items()) or "no Drive access for this file"
+        raise ValueError(f"No preview: {detail}")
+    name = str(meta.get("name") or "")
+    mime = str(meta.get("mimeType") or "")
+    ext = Path(name).suffix.lower()
+    if not mime.startswith("image/") or ext not in PREVIEW_EXTS:
+        raise ValueError("Previews are for pictures only (png, jpg, gif, webp, bmp)")
+    try:
+        size = int(meta.get("size")) if meta.get("size") is not None else None
+    except (TypeError, ValueError):
+        size = None
+    if size is not None and size > PREVIEW_MAX_BYTES:
+        raise ValueError(f"Picture is {_human_size(size)} — too big to preview ({_human_size(PREVIEW_MAX_BYTES)} max)")
+    file_id = str(meta.get("id") or file_id)
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    dest = dest_dir / f"{file_id}{ext}"
+    if dest.is_file() and dest.stat().st_size > 0:
+        return {"path": str(dest), "name": name, "mime": PREVIEW_EXTS[ext], "bytes": dest.stat().st_size}
+    tmp = dest.with_suffix(dest.suffix + ".part")
+    errors = {}
+    got: dict[str, Any] | None = None
+    try:
+        for mode in _auth_modes(account):
+            try:
+                got = _download_stream(file_id, mode, tmp, PREVIEW_MAX_BYTES, str(meta.get("md5Checksum") or ""), account)
+                break
+            except urllib.error.HTTPError as exc:
+                errors[mode] = f"HTTP {exc.code}: {auth._http_error_detail(exc)}"
+            except (urllib.error.URLError, ValueError) as exc:
+                errors[mode] = str(exc)
+        if got is None:
+            detail = "; ".join(f"{m}: {e}" for m, e in errors.items()) or "no access mode available"
+            raise ValueError(f"No preview: {detail}")
+        os.replace(tmp, dest)
+    finally:
+        tmp.unlink(missing_ok=True)
+    return {"path": str(dest), "name": name, "mime": PREVIEW_EXTS[ext], "bytes": got["bytes"]}

@@ -52,6 +52,7 @@ from .drive import (  # noqa: F401 — re-exported for scripts/selfcheck.py
     parse_content_disposition,
     parse_content_range_total,
     parse_public_confirm_form,
+    preview_image,
     safe_extract_zip,
     sanitize_filename,
 )
@@ -129,17 +130,19 @@ def register(api: Any) -> None:
         folder: str = "",
         page_size: int = 50,
         page_token: str = "",
+        account: str = "",
         pretty: bool = False,
     ) -> str:
         """List a Google Drive folder (models/textures/audio flagged as importable).
 
-        folder: a Drive folder link/id. Empty → the user's configured "Your Drive
-        folder" (Settings → Google Drive) if set, else My Drive root (signed-in
-        only). API-key mode can only list public folders. Returns id/name/kind/size
-        rows — pass a row's id to gdrive_download or gdrive_import_to_uefn.
+        folder: a Drive folder link/id or "root". Empty → the user's configured "Your
+        Drive folder" (Settings → Google Drive) if set, else My Drive root (signed-in
+        only). API-key mode can only list public folders. account: which connected
+        Google account (email); empty = the first one with Drive. Returns
+        id/name/kind/size rows — pass a row's id to gdrive_download or gdrive_import_to_uefn.
         """
         try:
-            data = list_drive(folder, page_size=page_size, page_token=page_token)
+            data = list_drive(str(folder or ""), page_size=page_size, page_token=page_token, account=str(account or ""))
             data["ok"] = True
             return _tool_json(data, pretty=pretty)
         except Exception as exc:  # noqa: BLE001
@@ -152,18 +155,23 @@ def register(api: Any) -> None:
         kind: str = "any",
         page_size: int = 25,
         page_token: str = "",
+        account: str = "",
         pretty: bool = False,
     ) -> str:
         """Search Google Drive by filename (kind: any|model|texture|audio|archive|folder).
 
         OAuth mode searches the whole Drive (optionally scoped to folder); API-key
-        mode requires folder=<public folder link>. Kind filtering happens on the
-        returned page, so a page can come back empty while next_page_token remains.
+        mode requires folder=<public folder link>. account: which connected Google
+        account (email). Kind filtering happens on the returned page, so a page can
+        come back empty while next_page_token remains.
         """
         try:
             if not str(query or "").strip():
                 raise ValueError("query is required — e.g. gdrive_search(query=\"barrel\")")
-            data = list_drive(folder, query=str(query), page_size=page_size, page_token=page_token)
+            data = list_drive(
+                str(folder or ""), query=str(query), page_size=page_size, page_token=page_token,
+                account=str(account or ""),
+            )
             want = str(kind or "any").strip().lower()
             if want not in ("", "any"):
                 before = len(data["files"])
@@ -175,14 +183,15 @@ def register(api: Any) -> None:
             return _fail(exc, pretty)
 
     @api.tool(listener=False)
-    def gdrive_file_info(file: str, pretty: bool = False) -> str:
+    def gdrive_file_info(file: str, account: str = "", pretty: bool = False) -> str:
         """Metadata for one Drive file (name, size, type, importability) before downloading.
 
-        file: share link or id. Uses OAuth/API key when available, else a public probe.
+        file: share link or id. account: which connected Google account (email). Uses
+        OAuth/API key when available, else a public probe.
         """
         try:
             file_id = extract_drive_id(str(file or ""))
-            meta, mode, errors = _fetch_metadata(file_id)
+            meta, mode, errors = _fetch_metadata(file_id, str(account or ""))
             if not meta:
                 meta = _public_probe(file_id)
                 mode = "public" if meta else ""
@@ -225,6 +234,7 @@ def register(api: Any) -> None:
         subfolder: str = "",
         overwrite: bool = False,
         extract: bool = True,
+        account: str = "",
         pretty: bool = False,
     ) -> str:
         """Download a Drive file into the local staging folder (models/textures/audio/zip only).
@@ -241,6 +251,7 @@ def register(api: Any) -> None:
                 subfolder=str(subfolder or ""),
                 overwrite=bool(overwrite),
                 extract_archives=bool(extract),
+                account=str(account or ""),
             )
             result["ok"] = True
             importable = [
@@ -266,6 +277,7 @@ def register(api: Any) -> None:
         local_path: str = "",
         destination_path: str = "",
         replace_existing: bool = True,
+        account: str = "",
         pretty: bool = False,
     ) -> str:
         """Download a Drive file AND import it into UEFN as a real asset, in one call.
@@ -303,7 +315,7 @@ def register(api: Any) -> None:
                 else:
                     files = [p]
             elif str(file or "").strip():
-                download_info = download_to_staging(str(file), extract_archives=True)
+                download_info = download_to_staging(str(file), extract_archives=True, account=str(account or ""))
                 main = Path(str(download_info["path"]))
                 if main.suffix.lower() != ".zip":
                     files = [main]
@@ -397,6 +409,28 @@ def register(api: Any) -> None:
             return {"ok": True, "path": result["path"], "result": result}
         except Exception as exc:  # noqa: BLE001
             return {"ok": False, "error": str(exc) or exc.__class__.__name__}
+
+    @api.tool(listener=False)
+    def gdrive_preview(file: str, account: str = "", pretty: bool = False) -> str:
+        """Preview a Drive picture in the Google tab: returns a local media url for it.
+
+        file: share link or id of a png/jpg/gif/webp/bmp (20 MB max). account: which
+        connected Google account (email). Returns {ok, url, name, mime}.
+        """
+        try:
+            got = preview_image(
+                str(file or ""), Path(api.local_dir("drive-previews")), account=str(account or "")
+            )
+            url = api.media_url(got["path"])
+            if not url:
+                raise ValueError("This picture type can't be shown in the tab")
+            return _tool_json({"ok": True, "url": url, "name": got["name"], "mime": got["mime"]}, pretty=pretty)
+        except Exception as exc:  # noqa: BLE001
+            return _fail(exc, pretty)
+
+    # The Drive tab calls the same functions as panel RPCs.
+    for _rpc in (gdrive_list, gdrive_search, gdrive_file_info, gdrive_import_to_uefn, gdrive_preview):
+        api.register_panel_rpc(_rpc.__name__, _rpc)
 
     display.register(api)
 

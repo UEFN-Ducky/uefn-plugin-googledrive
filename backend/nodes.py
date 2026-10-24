@@ -9,6 +9,7 @@ No package-relative imports, so tests can load it by file.
 """
 from __future__ import annotations
 
+import json
 from typing import Any, Callable
 
 NODE_PREFIX = "googledrive."
@@ -68,6 +69,16 @@ def _ids(value: Any) -> list[str]:
     return [p.strip() for p in text.replace("\n", ",").split(",") if p.strip()]
 
 
+def _parsed(value: Any) -> Any:
+    """``api.call_tool`` can hand back the tool's JSON text: decode it, else keep the value."""
+    if isinstance(value, (str, bytes)):
+        try:
+            return json.loads(value)
+        except ValueError:
+            return value
+    return value
+
+
 def _addresses(value: Any) -> str:
     if isinstance(value, (list, tuple)):
         return ", ".join(_str(v) for v in value if _str(v))
@@ -109,9 +120,11 @@ class GmailNodes:
 
     def _run(self, tool: str, args: dict[str, Any]) -> dict[str, Any]:
         try:
-            out = self._call(tool, {k: v for k, v in args.items() if v not in (None, "")})
+            out = _parsed(self._call(tool, {k: v for k, v in args.items() if v not in (None, "")}))
         except ValueError as exc:
-            return {"ok": False, "error": str(exc) or f"{tool} failed."}
+            err = _parsed(str(exc))
+            msg = _str(err.get("error")) if isinstance(err, dict) else str(exc)
+            return {"ok": False, "error": msg or f"{tool} failed."}
         if not isinstance(out, dict):
             return {"ok": False, "error": f"{tool} returned no result."}
         if out.get("ok") is False:

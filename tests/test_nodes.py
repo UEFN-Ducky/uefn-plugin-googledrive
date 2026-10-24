@@ -224,6 +224,24 @@ def test_draft_replies_template_runs_end_to_end_with_fakes():
     assert tools.calls[1][1]["reply_to_id"] == "m7"
 
 
+def test_json_string_results_are_parsed():
+    """call_tool may return the tool's JSON text: errors read plainly, successes become data."""
+    err = json.dumps({"ok": False, "error": "Gmail is not turned on for this account"})
+    out = nodes_mod.GmailNodes(lambda name, args: err).list({})
+    assert out["ok"] is False and out["error"] == "Gmail is not turned on for this account"
+
+    ok = json.dumps({"ok": True, "messages": MSGS})
+    out = nodes_mod.GmailNodes(lambda name, args: ok).list({})
+    assert out["ok"] and out["count"] == 2 and out["messages"][0]["id"] == "m1"
+
+    def raises(name, args):
+        raise ValueError(err)
+
+    out = nodes_mod.GmailNodes(raises).search({"inputs": {"query": "x"}})
+    assert out["error"] == "Gmail is not turned on for this account"
+    assert nodes_mod.GmailNodes(lambda n, a: "not json").get({"inputs": {"id": "m1"}})["ok"] is False
+
+
 @pytest.mark.parametrize("method", ["list", "search", "get", "draft", "send", "modify"])
 def test_tool_errors_stop_the_run_with_a_message(method):
     tool = {"list": "gmail_list", "search": "gmail_search", "get": "gmail_get", "draft": "gmail_draft_create",

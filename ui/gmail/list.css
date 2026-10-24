@@ -1,0 +1,138 @@
+/* Gmail view: floating labels card + frameless message list. Appearance variables only. */
+
+.gw-gmail { gap: 0; }
+
+.gw-side {
+  flex: none;
+  width: 220px;
+  margin: 4px 0 12px 12px;
+  padding: 8px;
+  overflow-y: auto;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: var(--card);
+}
+
+.gw-side__group + .gw-side__group {
+  margin-top: 8px;
+  padding-top: 8px;
+  border-top: 1px solid var(--border);
+}
+
+.gw-side__heading {
+  margin: 10px 8px 4px;
+  font-size: 0.8em;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  opacity: 0.6;
+}
+
+.gw-side__item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 6px 8px;
+  border: 0;
+  border-radius: 8px;
+  background: none;
+  color: var(--fg);
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+.gw-side__item:hover { background: color-mix(in srgb, var(--accent) 8%, var(--card)); }
+.gw-side__item.is-on { background: color-mix(in srgb, var(--accent) 18%, var(--card)); font-weight: 600; }
+.gw-side__item--combined { font-weight: 600; }
+.gw-side__name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.gw-side__count { font-size: 0.85em; font-weight: 600; }
+.gw-side__dots { display: inline-flex; gap: 2px; }
+.gw-side__dots .gw-dot { width: 6px; height: 6px; }
+
+.gw-mail {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  padding: 4px 12px 0;
+}
+
+.gw-mail__bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding-bottom: 8px;
+}
+.gw-mail__title {
+  margin: 0;
+  font-size: 1.05em;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 30%;
+}
+.gw-search { flex: 1; min-width: 0; }
+.gw-search .dk-input { width: 100%; box-sizing: border-box; }
+
+.gw-bulk {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+  padding: 6px 8px;
+  margin-bottom: 6px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--card);
+}
+.gw-bulk__count { margin-right: 6px; font-weight: 600; }
+
+.gw-mail__status:empty { display: none; }
+.gw-mail__status { padding: 8px 0; }
+.gw-mail__warn { padding: 4px 0; }
+
+.gw-list {
+  position: relative;
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  border-top: 1px solid var(--border);
+}
+.gw-list:focus-visible { outline-offset: -2px; }
+.gw-list__spacer { position: relative; }
+.gw-list__rows { position: absolute; top: 0; left: 0; right: 0; will-change: transform; }
+.gw-mail__more { padding: 10px; text-align: center; font-size: 0.9em; }
+.gw-mail__more:empty { display: none; }
+
+.gw-row {
+  box-sizing: border-box;
+  height: 56px;
+  display: grid;
+  grid-template-columns: auto auto minmax(90px, 200px) 1fr auto;
+  align-items: center;
+  gap: 10px;
+  padding: 0 10px;
+  border-bottom: 1px solid var(--border);
+  cursor: pointer;
+}
+.gw-row:hover { background: color-mix(in srgb, var(--accent) 6%, var(--bg)); }
+.gw-row.is-sel { background: color-mix(in srgb, var(--accent) 14%, var(--bg)); }
+.gw-row.is-active { box-shadow: inset 0 0 0 2px var(--accent); }
+.gw-row__nodot { width: 0; }
+
+.gw-row__check { margin: 0; accent-color: var(--accent); }
+.gw-row__from,
+.gw-row__subject,
+.gw-row__snippet { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.gw-row__text { min-width: 0; display: flex; flex-direction: column; gap: 2px; }
+.gw-row__snippet { opacity: 0.65; font-size: 0.9em; }
+.gw-row__date { font-size: 0.85em; opacity: 0.75; white-space: nowrap; }
+.gw-row__star { color: var(--amber); margin-right: 4px; }
+.gw-row.is-unread .gw-row__from,
+.gw-row.is-unread .gw-row__subject,
+.gw-row.is-unread .gw-row__date { font-weight: 700; opacity: 1; }
+
+@media (max-width: 640px) {
+  .gw-side { width: 160px; }
+  .gw-row { grid-template-columns: auto auto minmax(70px, 120px) 1fr auto; gap: 6px; }
+}

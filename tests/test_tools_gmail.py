@@ -117,12 +117,58 @@ class FakeGmail:
         self.sent.append(sent)
         return {k: sent[k] for k in ("id", "threadId", "labelIds")}
 
+    def _draft_message(self, did, raw, thread_id):
+        parsed = tg.mime.parse_raw(raw)
+        headers = [{"name": k, "value": v} for k, v in parsed["headers"].items()]
+        parts = [{"mimeType": "text/plain", "body": {"data": b64(parsed["text"])}}]
+        return {"id": f"dm-{did}", "threadId": thread_id or f"t-{did}", "labelIds": ["DRAFT"],
+                "internalDate": "1", "payload": {"mimeType": "multipart/alternative", "headers": headers, "parts": parts}}
 
-def make(*clients, store=None, tmp_path=None, **options):
+    def create_draft(self, raw, thread_id=""):
+        did = f"d{next(self._ids)}"
+        self.drafts[did] = {"id": did, "message": self._draft_message(did, raw, thread_id)}
+        return self.drafts[did]
+
+    def update_draft(self, did, raw, thread_id=""):
+        self.drafts[did] = {"id": did, "message": self._draft_message(did, raw, thread_id)}
+        return self.drafts[did]
+
+    def get_draft(self, did, format="full"):
+        return self.drafts[did]
+
+    def list_drafts(self, q="", max=20, *, page_token=""):
+        return {"drafts": [{"id": d} for d in list(self.drafts)[:max]], "ids": list(self.drafts)[:max]}
+
+    def send_draft(self, did):
+        draft = self.drafts.pop(did)
+        self.sent.append({"id": draft["message"]["id"], "draft": did})
+        return {"id": draft["message"]["id"], "threadId": draft["message"]["threadId"]}
+
+
+def make(*clients, stores=None, hits=None, tmp_path=None, **options):
     by = {c.email: c for c in clients}
     api = FakeApi(tmp_path)
-    tools = tg.GmailTools(api, accounts=lambda: list(by), client_for=lambda a: by[a], store=store, **options)
+    if hits is not None:
+        api.search = FakeSearch(hits)
+    store_for = (lambda a: stores[a]) if stores else None
+    tools = tg.GmailTools(api, accounts=lambda: list(by), client_for=lambda a: by[a], store_for=store_for, **options)
     return tools, api
+
+
+class FakeSearch:
+    def __init__(self, hits):
+        self.hits = hits
+
+    def query(self, text, limit=10):
+        return list(self.hits)[:limit]
+
+
+class FakeStore:
+    def __init__(self, docs):
+        self.docs = docs
+
+    def get(self, mid):
+        return self.docs.get(mid)
 
 
 class FakeChangeset:
@@ -243,14 +289,18 @@ def test_labels_and_unread_count(tmp_path):
     assert tools.gmail_unread_count()["unread"] == 1
 
 
-def test_find_uses_the_local_store_else_keyword_search(tmp_path):
-    class Store:
-        def find(self, query, *, account="", limit=10):
-            return [{"id": "m2", "subject": "Logo", "account": ME}]
-
-    tools, _ = make(FakeGmail(messages=INBOX), store=Store(), tmp_path=tmp_path)
+def test_find_reads_mail_search_records_and_fills_rows_from_the_cache(tmp_path):
+    hits = [
+        {"id": "drive.file1", "title": "logo.psd", "meta": {"account": ME, "id": "file1"}},  # not mail
+        {"id": "gmail.abc.m2", "title": "Logo", "snippet": "New pass", "score": 0.9,
+         "meta": {"account": ME, "id": "m2", "threadId": "t-m2", "date": 5}},
+        {"id": "gmail.zzz.x1", "title": "Other", "meta": {"account": "stranger@example.com", "id": "x1"}},
+    ]
+    stores = {ME: FakeStore({"m2": {"from": "Ana <ana@example.com>", "subject": "Logo", "unread": True}})}
+    tools, _ = make(FakeGmail(messages=INBOX), hits=hits, stores=stores, tmp_path=tmp_path)
     out = tools.gmail_find("the artwork from Ana")
-    assert out["mode"] == "meaning" and out["messages"][0]["id"] == "m2"
+    assert out["mode"] == "meaning" and [m["id"] for m in out["messages"]] == ["m2"]
+    assert out["messages"][0]["from"] == "Ana <ana@example.com>" and out["messages"][0]["unread"]
     plain, _ = make(FakeGmail(messages=INBOX), tmp_path=tmp_path)
     assert plain.gmail_find("logo")["mode"] == "keyword"
 
@@ -267,6 +317,82 @@ def test_attachment_download_saves_in_local_dir_with_a_size_cap(tmp_path):
     small, _ = make(client, tmp_path=tmp_path, max_attachment_bytes=2)
     with pytest.raises(tg.ToolError, match="limit"):
         small.gmail_attachment_download("m2", attachment_id="att-m2-1")
+
+
+# ── write ──────────────────────────────────────────────────────────────────
+
+
+def sent_headers(client, i=-1):
+    return tg.mime.parse_raw(client.sent[i]["raw"])
+
+
+def test_send_builds_the_mail_and_records_a_manual_change(tmp_path):
+    client = FakeGmail()
+    tools, api = make(client, tmp_path=tmp_path)
+    out = tools.gmail_send("ana@example.com", "Logo v2", "Looks great", cc="sam@example.com")
+    assert out["ok"] and out["sent"] and out["id"].startswith("sent")
+    msg = sent_headers(client)
+    assert msg["to"][0]["email"] == "ana@example.com" and msg["cc"][0]["email"] == "sam@example.com"
+    assert msg["from"]["email"] == ME and msg["subject"] == "Logo v2" and "Looks great" in msg["text"]
+    rec = api.changeset.records[-1]
+    assert rec["command"] == "gmail_send" and rec["revertable"] == "manual" and rec["inverse"] == []
+    assert "Looks great" not in str(rec)  # the ledger never holds the body
+
+
+def test_send_without_a_recipient_is_refused(tmp_path):
+    api = FakeApi(tmp_path)
+    client = FakeGmail()
+    tg.register(api, accounts=lambda: [ME], client_for=lambda a: client)
+    out = api.tools["gmail_send"](to="", subject="x", body="y")
+    assert out["ok"] is False and "recipient" in out["error"] and client.sent == []
+
+
+def test_reply_threads_with_in_reply_to_and_references(tmp_path):
+    client = FakeGmail(messages=[gmail_message("m1", subject="Build tonight?", thread="t-build")])
+    tools, _ = make(client, tmp_path=tmp_path)
+    out = tools.gmail_reply("m1", "Pushing now")
+    assert out["threadId"] == "t-build" and client.sent[-1]["threadId"] == "t-build"
+    msg = sent_headers(client)
+    assert msg["subject"] == "Re: Build tonight?"
+    assert msg["in_reply_to"] == "<m1@mail.example.com>" and "<m1@mail.example.com>" in msg["references"]
+    assert msg["to"][0]["email"] == "sam@example.com" and msg["cc"] == []
+    assert "> Hi there" in msg["text"]
+
+
+def test_reply_all_copies_the_others_but_not_me(tmp_path):
+    original = gmail_message("m1", to=f"{ME}, Lee <lee@example.com>")
+    client = FakeGmail(messages=[original])
+    tools, _ = make(client, tmp_path=tmp_path)
+    tools.gmail_reply("m1", "Thanks all", reply_all=True)
+    msg = sent_headers(client)
+    assert [a["email"] for a in msg["cc"]] == ["lee@example.com"]
+
+
+def test_forward_carries_the_attachments(tmp_path):
+    client = FakeGmail(messages=[gmail_message("m2", subject="Logo", attachments=[("logo.png", "image/png", 4)])])
+    client.attachments["att-m2-1"] = b"\x89PNG"
+    tools, _ = make(client, tmp_path=tmp_path)
+    out = tools.gmail_forward("m2", "lee@example.com", body="FYI")
+    msg = sent_headers(client)
+    assert out["ok"] and msg["subject"] == "Fwd: Logo" and msg["text"].startswith("FYI")
+    assert [(a["filename"], a["data"]) for a in msg["attachments"]] == [("logo.png", b"\x89PNG")]
+
+
+def test_drafts_create_reply_update_list_and_send(tmp_path):
+    client = FakeGmail(messages=[gmail_message("m1", subject="Build tonight?", thread="t-build")])
+    tools, api = make(client, tmp_path=tmp_path)
+    made = tools.gmail_draft_create(body="On it", reply_to_id="m1")
+    did = made["draft_id"]
+    assert made["draft"]["threadId"] == "t-build" and client.sent == []  # a draft never sends
+    tools.gmail_draft_update(did, body="On it, 10 min")
+    again = tg.mime.parse_message(client.drafts[did]["message"])
+    assert again["text"].startswith("On it, 10 min") and again["subject"] == "Re: Build tonight?"
+    assert again["in_reply_to"] == "<m1@mail.example.com>" and client.drafts[did]["message"]["threadId"] == "t-build"
+    listed = tools.gmail_draft_list()
+    assert [d["draft_id"] for d in listed["drafts"]] == [did]
+    sent = tools.gmail_draft_send(did)
+    assert sent["sent"] and client.sent[-1]["draft"] == did
+    assert [r["command"] for r in api.changeset.records] == ["gmail_draft_create", "gmail_draft_update", "gmail_draft_send"]
 
 
 def test_safe_filename_strips_paths_and_reserved_names():

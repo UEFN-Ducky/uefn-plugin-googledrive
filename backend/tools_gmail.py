@@ -5,8 +5,11 @@ Every tool is a ``GmailTools`` method; ``register(api, ...)`` adds each one as a
 agent run the same code.
 
   - Read: list, search, get, thread, labels, unread count, find (meaning search over
-    the local mail cache) and attachment download. Message bodies come back wrapped as
-    untrusted data; lists carry a ``display`` table (display.py).
+    the mail cache's ``api.search`` records) and attachment download. Message bodies
+    come back wrapped as untrusted data; lists carry a ``display`` table (display.py).
+  - Write: drafts, send, reply, forward. Sending tools are ``destructive_tools`` in
+    plugin.json, so Ducky asks the person before each call; every write is recorded
+    in the Changes ledger (a sent mail can't be unsent, so those are manual).
 
 The Google sign-in lives elsewhere: ``accounts()`` names the connected accounts with
 Gmail turned on and ``client_for(account)`` returns a ``gmail.GmailClient`` for one.
@@ -159,13 +162,13 @@ class GmailTools:
         *,
         accounts: AccountsFn,
         client_for: ClientFn,
-        store: Any = None,
+        store_for: Callable[[str], Any] | None = None,
         max_attachment_bytes: int = ATTACHMENT_MAX_BYTES,
     ) -> None:
         self.api = api
         self._accounts_fn = accounts
         self._client_for = client_for
-        self.store = store
+        self._store_for = store_for
         self.max_attachment_bytes = int(max_attachment_bytes)
 
     # ── accounts ──────────────────────────────────────────────────────────
@@ -373,27 +376,55 @@ class GmailTools:
             by_account[acct] = int(info.get("messagesUnread") or 0)
         return {"ok": True, "label": _str(label) or "INBOX", "unread": sum(by_account.values()), "by_account": by_account}
 
+    def _cached(self, account: str, message_id: str) -> dict[str, Any] | None:
+        if self._store_for is None:
+            return None
+        try:
+            return self._store_for(account).get(message_id)
+        except Exception:  # noqa: BLE001 - the cache is optional; the hit still shows
+            return None
+
     def gmail_find(self, query: str, max_results: int = 10, account: str = "") -> dict[str, Any]:
         """Find emails by meaning ("the invoice from the logo artist") in the local mail copy.
 
-        Falls back to a Gmail keyword search when the local copy is not ready. Returns
+        Falls back to a Gmail keyword search when the local copy has no match yet. Returns
         {ok, messages, mode: meaning | keyword, display}.
         """
         q = _str(query)
         if not q:
             raise ToolError("query is required")
         want = _count(max_results, 10)
-        finder = getattr(self.store, "find", None) or getattr(self.store, "search", None)
-        if finder is None:
+        accts = {a.lower(): a for a in self.read_accounts(account)}
+        search = getattr(self.api, "search", None)
+        hits = search.query(q, limit=min(50, want * 3)) if search is not None else []
+        rows: list[dict[str, Any]] = []
+        for hit in hits or []:
+            meta = hit.get("meta") or {}
+            acct = accts.get(_str(meta.get("account")).lower())
+            mid = _str(meta.get("id"))
+            if not acct or not mid or not str(hit.get("id") or "").startswith("gmail."):
+                continue  # another account, or a non-mail record
+            cached = self._cached(acct, mid) or {}
+            rows.append({
+                "id": mid,
+                "threadId": _str(meta.get("threadId")) or cached.get("threadId", ""),
+                "from": cached.get("from", ""),
+                "subject": cached.get("subject") or hit.get("title", ""),
+                "snippet": cached.get("snippet") or hit.get("snippet", ""),
+                "internalDate": _str(cached.get("date") or meta.get("date")),
+                "unread": bool(cached.get("unread")),
+                "labels": list(cached.get("labels") or []),
+                "account": acct,
+                "score": hit.get("score"),
+            })
+            if len(rows) >= want:
+                break
+        if not rows:
             out = self.gmail_search(q, want, account=account)
             out["mode"] = "keyword"
             return out
-        accts = self.read_accounts(account)
-        found = finder(q, account=accts[0] if len(accts) == 1 else "", limit=want)
-        rows = found.get("messages") if isinstance(found, dict) else found
-        rows = [r for r in rows or [] if isinstance(r, dict) and (len(accts) > 1 or not r.get("account") or r.get("account") in accts)]
-        out = {"ok": True, "messages": rows[:want], "count": len(rows[:want]), "mode": "meaning", "query": q}
-        return display.with_display(out, display.messages_markdown(out["messages"], title=q, account=_str(account)))
+        out = {"ok": True, "messages": rows, "count": len(rows), "mode": "meaning", "query": q}
+        return display.with_display(out, display.messages_markdown(rows, title=q, account=_str(account)))
 
     def _attachment(self, msg: dict[str, Any], attachment_id: str, filename: str) -> dict[str, Any]:
         atts = mime.list_attachments(msg.get("payload") or {})
@@ -438,6 +469,192 @@ class GmailTools:
         return {"ok": True, "path": str(path), "filename": path.name, "mimeType": att["mimeType"],
                 "size": path.stat().st_size, "account": acct}
 
+    # ── write ─────────────────────────────────────────────────────────────
+
+    def write_account(self, account: str = "") -> str:
+        """The one account a change happens in: the named one, else the only one."""
+        if _str(account):
+            return self._named(account)
+        accts = self.accounts()
+        if not accts:
+            raise self._no_accounts()
+        if len(accts) > 1:
+            raise ToolError(
+                f"Several Google accounts are connected ({', '.join(accts)}): say which one to use with account=. "
+                "Nothing was changed."
+            )
+        return accts[0]
+
+    def record(self, *, command: str, kind: str, ident: str, summary: str, account: str,
+               targets: list[dict[str, Any]], inverse: list[dict[str, Any]] | None = None,
+               before: dict[str, Any] | None = None) -> None:
+        """One Changes-ledger entry; ``inverse`` (tool calls) makes it revertable."""
+        changeset = getattr(self.api, "changeset", None)
+        if changeset is None:
+            return
+        try:
+            changeset.record(
+                command=command,
+                kind=kind,
+                ident=f"{account}:{ident}",
+                before=before or {},
+                inverse=list(inverse or []),
+                targets=targets,
+                summary=summary,
+                revertable="auto" if inverse else "manual",
+                params={"account": account},
+            )
+        except Exception:  # noqa: BLE001 - the ledger never fails the tool
+            pass
+
+    def _original(self, client: Any, message_id: str) -> dict[str, Any]:
+        try:
+            return mime.parse_message(client.get_message(message_id, "full") or {})
+        except gmail.GmailError as exc:
+            if exc.status in (400, 404):
+                raise ToolError(f"No message {message_id} in this account.") from exc
+            raise
+
+    def _compose(self, client: Any, account: str, *, to: Any, subject: str, body: str, cc: Any, bcc: Any,
+                 html: str, reply_to_id: str = "") -> tuple[bytes, str, str]:
+        """(raw, threadId, subject) for a new mail, or a reply when ``reply_to_id`` is set."""
+        if _str(reply_to_id):
+            original = self._original(client, _str(reply_to_id))
+            built = mime.build_reply(original, text=body, html=html, self_email=account, sender=account)
+            return built["raw"], built["threadId"], mime.reply_subject(original.get("subject", ""))
+        raw = mime.build_message(to=to, cc=cc, bcc=bcc, subject=subject, text=body, html=html, sender=account)
+        return raw, "", subject
+
+    def _sent(self, command: str, account: str, res: dict[str, Any], subject: str, to: str) -> dict[str, Any]:
+        mid = _str(res.get("id"))
+        self.record(command=command, kind="email", ident=mid, account=account,
+                    summary=f"Sent “{subject or '(no subject)'}”" + (f" to {to}" if to else ""),
+                    targets=[{"kind": "email", "id": mid, "label": subject or "(no subject)", "path": mid}])
+        return {"ok": True, "sent": True, "id": mid, "threadId": _str(res.get("threadId")), "account": account,
+                "message": f"Sent “{subject or '(no subject)'}”" + (f" to {to}." if to else ".")}
+
+    def gmail_draft_create(self, to: str = "", subject: str = "", body: str = "", cc: str = "", bcc: str = "",
+                           html: str = "", reply_to_id: str = "", account: str = "") -> dict[str, Any]:
+        """Save a Gmail draft. Never sends.
+
+        reply_to_id: a message id to draft a reply to (threaded, To filled from it).
+        to / cc / bcc: comma-separated addresses. account: the sending account; needed when
+        several are connected. Returns {ok, draft: {id, message_id, threadId}, draft_id}.
+        """
+        acct = self.write_account(account)
+        c = self.client(acct)
+        raw, thread_id, subj = self._compose(c, acct, to=to, subject=subject, body=body, cc=cc, bcc=bcc,
+                                             html=html, reply_to_id=reply_to_id)
+        res = c.create_draft(raw, thread_id) or {}
+        draft = {"id": _str(res.get("id")), "message_id": _str((res.get("message") or {}).get("id")),
+                 "threadId": _str((res.get("message") or {}).get("threadId")) or thread_id}
+        self.record(command="gmail_draft_create", kind="draft", ident=draft["id"], account=acct,
+                    summary=f"Saved draft “{subj or '(no subject)'}”",
+                    targets=[{"kind": "draft", "id": draft["id"], "label": subj or "(no subject)", "path": draft["id"]}])
+        return {"ok": True, "draft": draft, "draft_id": draft["id"], "account": acct}
+
+    def gmail_draft_update(self, draft_id: str, to: str = "", subject: str = "", body: str = "", cc: str = "",
+                           bcc: str = "", html: str = "", account: str = "") -> dict[str, Any]:
+        """Change a draft. Fields left empty keep the draft's current value; reply threading is kept."""
+        acct = self.write_account(account)
+        c = self.client(acct)
+        did = _str(draft_id)
+        if not did:
+            raise ToolError("draft_id is required")
+        current = c.get_draft(did, "full") or {}
+        old = mime.parse_message(current.get("message") or {})
+        thread_id = _str((current.get("message") or {}).get("threadId"))
+        subj = subject or old.get("subject", "")
+        raw = mime.build_message(
+            to=to or old.get("to"),
+            cc=cc or old.get("cc"),
+            bcc=bcc or None,
+            subject=subj,
+            text=body or old.get("text", ""),
+            html=html or ("" if body else old.get("html", "")),
+            sender=acct,
+            in_reply_to=old.get("in_reply_to", ""),
+            references=old.get("references", ""),
+        )
+        res = c.update_draft(did, raw, thread_id) or {}
+        self.record(command="gmail_draft_update", kind="draft", ident=did, account=acct,
+                    summary=f"Changed draft “{subj or '(no subject)'}”",
+                    targets=[{"kind": "draft", "id": did, "label": subj or "(no subject)", "path": did}])
+        return {"ok": True, "draft": {"id": _str(res.get("id")) or did, "threadId": thread_id}, "draft_id": did,
+                "account": acct}
+
+    def gmail_draft_list(self, query: str = "", max_results: int = DEFAULT_MAX, account: str = "") -> dict[str, Any]:
+        """List drafts (optionally a Gmail query over them). Returns {ok, drafts: [{draft_id, id, to, subject…}]}."""
+        want = _count(max_results)
+        drafts: list[dict[str, Any]] = []
+        for acct in self.read_accounts(account):
+            c = self.client(acct)
+            for d in (c.list_drafts(q=_str(query), max=want) or {}).get("drafts") or []:
+                full = c.get_draft(d.get("id"), "metadata") or {}
+                r = row(full.get("message") or {}, acct)
+                r["draft_id"] = _str(d.get("id"))
+                drafts.append(r)
+        drafts.sort(key=_sort_key, reverse=True)
+        out = {"ok": True, "drafts": drafts[:want], "count": len(drafts[:want])}
+        return display.with_display(out, display.messages_markdown(out["drafts"], title="Drafts", account=_str(account)))
+
+    def gmail_draft_send(self, draft_id: str, account: str = "") -> dict[str, Any]:
+        """Send a saved draft. Ducky asks the person first. Returns {ok, sent, id, threadId}."""
+        acct = self.write_account(account)
+        c = self.client(acct)
+        did = _str(draft_id)
+        if not did:
+            raise ToolError("draft_id is required")
+        old = mime.parse_message((c.get_draft(did, "metadata") or {}).get("message") or {})
+        res = c.send_draft(did) or {}
+        return self._sent("gmail_draft_send", acct, res, old.get("subject", ""),
+                          ", ".join(_address(a) for a in old.get("to") or []))
+
+    def gmail_send(self, to: str, subject: str, body: str, cc: str = "", bcc: str = "", html: str = "",
+                   account: str = "") -> dict[str, Any]:
+        """Send a new email. Ducky asks the person first.
+
+        to / cc / bcc: comma-separated addresses. html: optional HTML body (body stays the
+        plain-text part). account: the sending account; needed when several are connected.
+        """
+        acct = self.write_account(account)
+        c = self.client(acct)
+        raw, _thread, subj = self._compose(c, acct, to=to, subject=subject, body=body, cc=cc, bcc=bcc, html=html)
+        return self._sent("gmail_send", acct, c.send_raw(raw) or {}, subj, _str(to))
+
+    def gmail_reply(self, id: str, body: str, reply_all: bool = False, html: str = "",
+                    account: str = "") -> dict[str, Any]:
+        """Reply to an email in its thread (quotes the original). Ducky asks the person first.
+
+        reply_all: also send to the original To and Cc (minus you).
+        """
+        acct = self.write_account(account)
+        c = self.client(acct)
+        original = self._original(c, _str(id))
+        built = mime.build_reply(original, text=body, html=html, reply_all=bool(reply_all), self_email=acct, sender=acct)
+        res = c.send_raw(built["raw"], built["threadId"]) or {}
+        to = ", ".join(_address(a) for a in built["to"] + built["cc"])
+        return self._sent("gmail_reply", acct, res, mime.reply_subject(original.get("subject", "")), to)
+
+    def gmail_forward(self, id: str, to: str, body: str = "", cc: str = "", include_attachments: bool = True,
+                      account: str = "") -> dict[str, Any]:
+        """Forward an email with its attachments. Ducky asks the person first."""
+        acct = self.write_account(account)
+        c = self.client(acct)
+        raw_msg = c.get_message(_str(id), "full") if _str(id) else None
+        if not raw_msg:
+            raise ToolError("id is required")
+        original = mime.parse_message(raw_msg)
+        files = []
+        if include_attachments:
+            for att in original.get("attachments") or []:
+                if att.get("attachmentId"):
+                    data = c.get_attachment(original["id"], att["attachmentId"])["data"]
+                    files.append({"filename": att["filename"], "data": data, "mimeType": att["mimeType"]})
+        built = mime.build_forward(original, to=to, text=body, cc=cc or None, attachments=files, sender=acct)
+        res = c.send_raw(built["raw"], built["threadId"]) or {}
+        return self._sent("gmail_forward", acct, res, mime.forward_subject(original.get("subject", "")), _str(to))
+
 
 READ_TOOLS = (
     "gmail_list",
@@ -448,8 +665,17 @@ READ_TOOLS = (
     "gmail_unread_count",
     "gmail_find",
     "gmail_attachment_download",
+    "gmail_draft_list",
 )
-TOOL_NAMES = READ_TOOLS
+WRITE_TOOLS = (
+    "gmail_draft_create",
+    "gmail_draft_update",
+    "gmail_draft_send",
+    "gmail_send",
+    "gmail_reply",
+    "gmail_forward",
+)
+TOOL_NAMES = READ_TOOLS + WRITE_TOOLS
 
 
 def _safe(method: Callable[..., dict[str, Any]]) -> Callable[..., dict[str, Any]]:
@@ -468,9 +694,14 @@ def _safe(method: Callable[..., dict[str, Any]]) -> Callable[..., dict[str, Any]
     return call
 
 
-def register(api: Any, *, accounts: AccountsFn, client_for: ClientFn, store: Any = None, **options: Any) -> GmailTools:
-    """Add every Gmail tool (``@api.tool(listener=False)``) and its panel RPC of the same name."""
-    tools = GmailTools(api, accounts=accounts, client_for=client_for, store=store, **options)
+def register(api: Any, *, accounts: AccountsFn, client_for: ClientFn, store_for: Callable[[str], Any] | None = None,
+             **options: Any) -> GmailTools:
+    """Add every Gmail tool (``@api.tool(listener=False)``) and its panel RPC of the same name.
+
+    accounts(): emails with Gmail on. client_for(email): a gmail.GmailClient.
+    store_for(email): that account's mail_store.MailStore (optional, fills in find hits).
+    """
+    tools = GmailTools(api, accounts=accounts, client_for=client_for, store_for=store_for, **options)
     for name in TOOL_NAMES:
         fn = _safe(getattr(tools, name))
         api.tool(listener=False)(fn)

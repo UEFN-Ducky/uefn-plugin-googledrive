@@ -1,12 +1,27 @@
-"""Google sign-in for the googledrive plugin: secrets, the Google-only HTTP core, OAuth.
+"""Google sign-in for the googledrive plugin: accounts, the Google-only HTTP core, OAuth.
 
-Safety model (deliberate — keep it this way):
-  - Requests go ONLY to Google hosts (accounts.google.com, oauth2/www
-    .googleapis.com, drive[.usercontent].google.com, *.googleusercontent.com
-    redirects), including every redirect.
-  - OAuth uses the loopback redirect + state + PKCE (S256). Tokens live in the
-    app's encrypted credential store (never in this package, never logged,
-    never returned).
+Sign-in (``connect``) is a loopback OAuth flow on 127.0.0.1:<free port> with ``state``
+and PKCE (S256). It always asks for Drive read access; Gmail (``gmail.modify``) and
+full Drive (``drive``) are added to an account only when turned on, with
+``include_granted_scopes=true`` so Google keeps what was granted before.
+
+Who holds the client secret:
+  - **Google Connect** (default): the secret lives only on uefnducky.org. The code swap
+    and every refresh go through ``POST {BROKER_BASE}/token`` / ``/refresh`` with a
+    UEFN Ducky sign-in proof from the Account plugin
+    (``api.call_tool("account_session_token", {"audience": "google-connect"})``).
+    ``POST {BROKER_BASE}/config`` gives the public client id. Answers are
+    ``{ok, payload}`` with Google's token fields in ``payload`` (or ``payload.tokens``).
+  - **Your own client** (Settings → Advanced: client id + secret): Google Connect is
+    skipped and the plugin talks to Google's token endpoint itself.
+
+Accounts live in the app's encrypted secret store under ``google_accounts``, one entry
+per Google account (tokens never logged or returned). The single sign-in of 1.0.x
+(``gdrive_oauth_token``) is moved into it on first use; the old key is kept until the
+moved account refreshes once, signs in again or is disconnected. Revoking goes
+straight to Google.
+
+Every request goes only to Google hosts and uefnducky.org, redirects included.
 """
 
 from __future__ import annotations
@@ -22,7 +37,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from http.server import BaseHTTPRequestHandler, HTTPServer
-from typing import Any
+from typing import Any, Callable
 
 log = logging.getLogger("uefn.plugin.googledrive")
 
@@ -30,13 +45,24 @@ PLUGIN_ID = "googledrive"
 KEY_API = "gdrive_api_key"
 KEY_CLIENT_ID = "gdrive_oauth_client_id"
 KEY_CLIENT_SECRET = "gdrive_oauth_client_secret"
-KEY_TOKEN = "gdrive_oauth_token"
+KEY_TOKEN = "gdrive_oauth_token"  # 1.0.x single sign-in, migrated into KEY_ACCOUNTS
+KEY_ACCOUNTS = "google_accounts"
 
-OAUTH_SCOPE = "https://www.googleapis.com/auth/drive.readonly"
+SCOPE_DRIVE_READ = "https://www.googleapis.com/auth/drive.readonly"
+SCOPE_DRIVE = "https://www.googleapis.com/auth/drive"
+SCOPE_GMAIL = "https://www.googleapis.com/auth/gmail.modify"
+OAUTH_SCOPE = SCOPE_DRIVE_READ
+
 AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth"
 TOKEN_URL = "https://oauth2.googleapis.com/token"
 REVOKE_URL = "https://oauth2.googleapis.com/revoke"
 ABOUT_URL = "https://www.googleapis.com/drive/v3/about"
+
+BROKER_BASE = "https://uefnducky.org/api/v1/plugins/google-connect/collect"
+BROKER_AUDIENCE = "google-connect"
+PROOF_TOOL = "account_session_token"
+
+CONNECT_TIMEOUT_MAX_S = 300.0
 
 _ALLOWED_HOSTS = {
     "www.googleapis.com",
@@ -45,9 +71,20 @@ _ALLOWED_HOSTS = {
     "drive.google.com",
     "docs.google.com",
     "drive.usercontent.google.com",
+    "gmail.googleapis.com",
+    "uefnducky.org",
 }
 
 _CONNECT_LOCK = threading.Lock()
+_STORE_LOCK = threading.RLock()
+_API: Any = None
+_broker_client_id_cache = ""
+
+
+def bind(api: Any) -> None:
+    """Give auth the plugin host api (for the Account plugin's sign-in proof)."""
+    global _API
+    _API = api
 
 
 def token_expired(tok: dict[str, Any], now: float | None = None) -> bool:
@@ -59,6 +96,52 @@ def token_expired(tok: dict[str, Any], now: float | None = None) -> bool:
     except (TypeError, ValueError):
         return True
     return (now if now is not None else time.time()) >= expires_at - 60.0
+
+
+def normalize_scopes(value: Any) -> list[str]:
+    """Scopes from a space-separated string or a list, deduplicated, order kept."""
+    if not value:
+        return []
+    if isinstance(value, str):
+        value = value.split()
+    return list(dict.fromkeys(str(s).strip() for s in value if str(s).strip()))
+
+
+def pkce_pair() -> tuple[str, str]:
+    """(verifier, S256 challenge) for one sign-in."""
+    verifier = pysecrets.token_urlsafe(64)[:100]
+    challenge = (
+        base64.urlsafe_b64encode(hashlib.sha256(verifier.encode("ascii")).digest())
+        .decode("ascii")
+        .rstrip("=")
+    )
+    return verifier, challenge
+
+
+def build_auth_url(
+    *,
+    client_id: str,
+    redirect_uri: str,
+    scopes: list[str],
+    state: str,
+    challenge: str,
+    login_hint: str = "",
+) -> str:
+    params = {
+        "client_id": client_id,
+        "redirect_uri": redirect_uri,
+        "response_type": "code",
+        "scope": " ".join(scopes),
+        "access_type": "offline",
+        "include_granted_scopes": "true",
+        "prompt": "consent",
+        "state": state,
+        "code_challenge": challenge,
+        "code_challenge_method": "S256",
+    }
+    if login_hint:
+        params["login_hint"] = login_hint
+    return AUTH_URL + "?" + urllib.parse.urlencode(params)
 
 
 # --------------------------------------------------------------------------- #
@@ -137,41 +220,14 @@ def _http_error_detail(exc: urllib.error.HTTPError) -> str:
     return body[:300]
 
 
-# --------------------------------------------------------------------------- #
-# OAuth (user's own Desktop-app client, read-only scope, PKCE).
-# --------------------------------------------------------------------------- #
-
-
-def _oauth_client() -> tuple[str, str]:
-    """The user's own OAuth client (client_id, client_secret) from Settings."""
-    return _get_secret(KEY_CLIENT_ID).strip(), _get_secret(KEY_CLIENT_SECRET).strip()
-
-
-def _using_bundled_client() -> bool:
-    """True when sign-in runs on a client shipped with the plugin (none ships today)."""
-    return False
-
-
-def _load_token() -> dict[str, Any] | None:
-    raw = _get_secret(KEY_TOKEN)
-    if not raw:
-        return None
-    try:
-        tok = json.loads(raw)
-        return tok if isinstance(tok, dict) else None
-    except (ValueError, TypeError):
-        return None
-
-
-def _save_token(tok: dict[str, Any]) -> None:
-    _set_secret(KEY_TOKEN, json.dumps(tok))
-
-
-def _clear_token() -> None:
-    _set_secret(KEY_TOKEN, "")
+_INVALID_GRANT_MSG = (
+    "Google rejected the saved sign-in (invalid_grant) — it was revoked or expired. "
+    "Sign in again with google_connect."
+)
 
 
 def _token_post(form: dict[str, str]) -> dict[str, Any]:
+    """Google's token endpoint directly (your own client only: it needs the secret)."""
     data = urllib.parse.urlencode(form).encode("utf-8")
     try:
         with _open(
@@ -185,31 +241,232 @@ def _token_post(form: dict[str, str]) -> dict[str, Any]:
     except urllib.error.HTTPError as exc:
         detail = _http_error_detail(exc)
         if "invalid_grant" in detail:
-            raise ValueError(
-                "Google rejected the saved sign-in (invalid_grant) — it was revoked or "
-                "expired. Run gdrive_connect again."
-            ) from exc
+            raise ValueError(_INVALID_GRANT_MSG) from exc
         raise ValueError(f"Google token endpoint error {exc.code}: {detail}") from exc
     except urllib.error.URLError as exc:
         raise ValueError(f"Network error reaching Google: {exc.reason}") from exc
 
 
-def _access_token() -> str:
-    """Current access token, refreshing if needed. Empty string when not connected."""
-    tok = _load_token()
-    if not tok:
-        return ""
-    if not token_expired(tok):
-        return str(tok.get("access_token") or "")
-    refresh = str(tok.get("refresh_token") or "")
-    if not refresh:
-        _clear_token()
-        return ""
-    client_id, client_secret = _oauth_client()
-    if not client_id or not client_secret:
-        return ""
+# --------------------------------------------------------------------------- #
+# Google Connect (uefnducky.org holds the client secret).
+# --------------------------------------------------------------------------- #
+
+
+def _session_proof() -> str:
+    """A short-lived UEFN Ducky sign-in proof for Google Connect, from the Account plugin."""
+    if _API is None or not callable(getattr(_API, "call_tool", None)):
+        raise ValueError("Google sign-in isn't ready: the plugin host is not connected yet")
     try:
-        fresh = _token_post(
+        out = _API.call_tool(PROOF_TOOL, {"audience": BROKER_AUDIENCE})
+    except Exception as exc:  # noqa: BLE001 — missing Account plugin, not signed in…
+        raise ValueError(
+            "Google sign-in needs the Ducky Account plugin and a UEFN Ducky sign-in "
+            "(Settings → Account), or your own OAuth client in Settings → Google → Advanced."
+        ) from exc
+    if isinstance(out, str):
+        try:
+            out = json.loads(out)
+        except ValueError:
+            out = {}
+    proof = str((out or {}).get("proof") or "") if isinstance(out, dict) else ""
+    if not proof or (isinstance(out, dict) and out.get("ok") is False):
+        raise ValueError(
+            "Sign in to UEFN Ducky first (Settings → Account) to use Google sign-in, or set "
+            "your own OAuth client in Settings → Google → Advanced."
+        )
+    return proof
+
+
+def _broker_post(event: str, body: dict[str, Any], *, proof: bool = True) -> dict[str, Any]:
+    payload = dict(body)
+    if proof:
+        payload["proof"] = _session_proof()
+    try:
+        with _open(
+            f"{BROKER_BASE}/{event}",
+            data=json.dumps(payload).encode("utf-8"),
+            method="POST",
+            headers={"Content-Type": "application/json", "Accept": "application/json"},
+            timeout=30,
+        ) as resp:
+            out = json.loads(resp.read().decode("utf-8") or "{}")
+    except urllib.error.HTTPError as exc:
+        detail = _http_error_detail(exc)
+        if "invalid_grant" in detail:
+            raise ValueError(_INVALID_GRANT_MSG) from exc
+        if exc.code == 401:
+            raise ValueError(
+                "Google Connect refused the UEFN Ducky sign-in — sign in again in Settings → Account"
+            ) from exc
+        raise ValueError(f"Google Connect error {exc.code}: {detail}") from exc
+    except urllib.error.URLError as exc:
+        raise ValueError(f"Network error reaching uefnducky.org: {exc.reason}") from exc
+    except ValueError as exc:
+        raise ValueError("Google Connect sent an answer that isn't JSON") from exc
+    if not isinstance(out, dict):
+        raise ValueError("Google Connect sent an unexpected answer")
+    if out.get("ok") is False or out.get("error"):
+        err = str(out.get("error") or "request failed")
+        if "invalid_grant" in err:
+            raise ValueError(_INVALID_GRANT_MSG)
+        raise ValueError(f"Google Connect: {err[:300]}")
+    result = out.get("payload", out)
+    if isinstance(result, dict) and isinstance(result.get("tokens"), dict):
+        result = result["tokens"]
+    return result if isinstance(result, dict) else {}
+
+
+def _broker_client_id() -> str:
+    global _broker_client_id_cache
+    if not _broker_client_id_cache:
+        cfg = _broker_post("config", {}, proof=False)
+        cid = str(cfg.get("clientId") or cfg.get("client_id") or "").strip()
+        if not cid:
+            raise ValueError("Google sign-in on uefnducky.org isn't switched on yet — try again later")
+        _broker_client_id_cache = cid
+    return _broker_client_id_cache
+
+
+# --------------------------------------------------------------------------- #
+# Clients and the account store.
+# --------------------------------------------------------------------------- #
+
+
+def _oauth_client() -> tuple[str, str]:
+    """The user's own OAuth client (client_id, client_secret) from Settings."""
+    return _get_secret(KEY_CLIENT_ID).strip(), _get_secret(KEY_CLIENT_SECRET).strip()
+
+
+def _uses_own_client() -> bool:
+    client_id, client_secret = _oauth_client()
+    return bool(client_id and client_secret)
+
+
+def _using_bundled_client() -> bool:
+    """True when sign-in goes through Google Connect (no own client set in Settings)."""
+    return not _uses_own_client() and _API is not None
+
+
+def sign_in_ready() -> bool:
+    return _uses_own_client() or _API is not None
+
+
+def _legacy_token() -> dict[str, Any] | None:
+    raw = _get_secret(KEY_TOKEN)
+    if not raw:
+        return None
+    try:
+        tok = json.loads(raw)
+        return tok if isinstance(tok, dict) else None
+    except (ValueError, TypeError):
+        return None
+
+
+def _clear_token() -> None:
+    """Erase the 1.0.x single sign-in."""
+    _set_secret(KEY_TOKEN, "")
+
+
+def _read_store() -> list[dict[str, Any]]:
+    raw = _get_secret(KEY_ACCOUNTS)
+    if not raw:
+        return []
+    try:
+        data = json.loads(raw)
+    except (ValueError, TypeError):
+        return []
+    accts = data.get("accounts") if isinstance(data, dict) else data
+    return [a for a in (accts or []) if isinstance(a, dict) and str(a.get("email") or "")]
+
+
+def _write_store(accts: list[dict[str, Any]]) -> None:
+    _set_secret(KEY_ACCOUNTS, json.dumps({"version": 1, "accounts": accts}))
+
+
+def _migrate_legacy(accts: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Move the 1.0.x sign-in into the account store (the old key stays until confirmed)."""
+    if accts:
+        return accts
+    tok = _legacy_token()
+    if not tok or not (tok.get("refresh_token") or tok.get("access_token")):
+        return accts
+    accts = [
+        {
+            "email": str(tok.get("email") or "") or "Google account",
+            "name": "",
+            "scopes": normalize_scopes(tok.get("scope")) or [SCOPE_DRIVE_READ],
+            "access_token": str(tok.get("access_token") or ""),
+            "refresh_token": str(tok.get("refresh_token") or ""),
+            "expires_at": float(tok.get("expires_at") or 0),
+            "via": "own",  # 1.0.x only ever signed in with the user's own client
+            "migrated": True,
+            "obtained_at": float(tok.get("obtained_at") or time.time()),
+        }
+    ]
+    _write_store(accts)
+    log.info("google sign-in: moved the saved 1.0 sign-in into the account store")
+    return accts
+
+
+def _accounts() -> list[dict[str, Any]]:
+    with _STORE_LOCK:
+        return _migrate_legacy(_read_store())
+
+
+def _find(accts: list[dict[str, Any]], account: str) -> dict[str, Any] | None:
+    want = str(account or "").strip().lower()
+    for a in accts:
+        if str(a.get("email") or "").lower() == want:
+            return a
+    return None
+
+
+def _confirm_migration(acct: dict[str, Any]) -> None:
+    """The moved 1.0.x account works (or is gone): drop the old key."""
+    if acct.pop("migrated", None):
+        _clear_token()
+
+
+def _public(acct: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "email": str(acct.get("email") or ""),
+        "name": str(acct.get("name") or ""),
+        "scopes": normalize_scopes(acct.get("scopes")),
+        "via": str(acct.get("via") or "broker"),
+        "needs_sign_in": bool(acct.get("needs_sign_in")),
+    }
+
+
+def list_accounts() -> list[dict[str, Any]]:
+    """Connected Google accounts in connection order: {email, name, scopes, via, needs_sign_in}."""
+    return [_public(a) for a in _accounts()]
+
+
+def gmail_accounts() -> list[str]:
+    return [a["email"] for a in list_accounts() if SCOPE_GMAIL in a["scopes"] and not a["needs_sign_in"]]
+
+
+def _has_drive(acct: dict[str, Any]) -> bool:
+    return any("/auth/drive" in s for s in normalize_scopes(acct.get("scopes")))
+
+
+# --------------------------------------------------------------------------- #
+# Access tokens.
+# --------------------------------------------------------------------------- #
+
+
+def _refresh_tokens(acct: dict[str, Any]) -> dict[str, Any]:
+    refresh = str(acct.get("refresh_token") or "")
+    if not refresh:
+        raise ValueError(_INVALID_GRANT_MSG)
+    if acct.get("via") == "own":
+        client_id, client_secret = _oauth_client()
+        if not client_id or not client_secret:
+            raise ValueError(
+                "This account was signed in with your own OAuth client, which is no longer "
+                "set in Settings — sign in again with google_connect"
+            )
+        return _token_post(
             {
                 "client_id": client_id,
                 "client_secret": client_secret,
@@ -217,23 +474,82 @@ def _access_token() -> str:
                 "grant_type": "refresh_token",
             }
         )
-    except ValueError as exc:
-        if "invalid_grant" in str(exc):
-            _clear_token()
-        raise
-    tok["access_token"] = str(fresh.get("access_token") or "")
-    tok["expires_at"] = time.time() + float(fresh.get("expires_in") or 3600) - 30.0
-    if fresh.get("refresh_token"):
-        tok["refresh_token"] = str(fresh["refresh_token"])
-    _save_token(tok)
-    return str(tok.get("access_token") or "")
+    return _broker_post("refresh", {"refresh_token": refresh})
+
+
+def access_token(account: str = "", *, scope: str = "") -> str:
+    """A current access token for one account (refreshed when needed). Raises ValueError.
+
+    account: the email; empty → the first account that has ``scope`` (or the first one).
+    """
+    with _STORE_LOCK:
+        accts = _accounts()
+        if not accts:
+            raise ValueError("No Google account is connected — sign in with google_connect")
+        if account:
+            acct = _find(accts, account)
+            if acct is None:
+                raise ValueError(f"No connected Google account matches {account!r}")
+        else:
+            acct = next((a for a in accts if not scope or scope in normalize_scopes(a.get("scopes"))), accts[0])
+        if scope and scope not in normalize_scopes(acct.get("scopes")):
+            what = "Gmail" if scope == SCOPE_GMAIL else "Manage Drive" if scope == SCOPE_DRIVE else scope
+            raise ValueError(f"Turn on {what} for this account first (google_connect)")
+        if not token_expired(acct):
+            return str(acct.get("access_token") or "")
+        try:
+            fresh = _refresh_tokens(acct)
+        except ValueError as exc:
+            if "invalid_grant" in str(exc):
+                acct["access_token"] = ""
+                acct["needs_sign_in"] = True
+                _write_store(accts)
+            raise
+        token = str(fresh.get("access_token") or "")
+        if not token:
+            raise ValueError("Google returned no access token on refresh — sign in again")
+        acct["access_token"] = token
+        acct["expires_at"] = time.time() + float(fresh.get("expires_in") or 3600) - 30.0
+        if fresh.get("refresh_token"):
+            acct["refresh_token"] = str(fresh["refresh_token"])
+        if fresh.get("scope"):
+            acct["scopes"] = normalize_scopes(fresh["scope"])
+        acct.pop("needs_sign_in", None)
+        _confirm_migration(acct)
+        _write_store(accts)
+        return token
+
+
+def access_token_getter(account: str = "", *, scope: str = "") -> Callable[[], str]:
+    """``token()`` for one account, for clients that call it before each request."""
+    return lambda: access_token(account, scope=scope)
+
+
+def _load_token() -> dict[str, Any] | None:
+    """The first account with Drive access as {email, scope} (no tokens), else None."""
+    acct = next((a for a in _accounts() if _has_drive(a) and not a.get("needs_sign_in")), None)
+    if acct is None:
+        return None
+    return {"email": str(acct.get("email") or ""), "scope": " ".join(normalize_scopes(acct.get("scopes")))}
+
+
+def _access_token() -> str:
+    """Drive access token of the first Drive account; empty string when none is connected."""
+    tok = _load_token()
+    return access_token(tok["email"]) if tok else ""
+
+
+# --------------------------------------------------------------------------- #
+# Sign-in (loopback + state + PKCE), disconnect.
+# --------------------------------------------------------------------------- #
 
 
 class _CallbackHandler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:  # noqa: N802 — BaseHTTPRequestHandler API
         query = urllib.parse.urlparse(self.path).query
         params = {k: v[0] for k, v in urllib.parse.parse_qs(query).items()}
-        self.server.oauth_result = params  # type: ignore[attr-defined]
+        if any(k in params for k in ("code", "error", "state")):
+            self.server.oauth_result = params  # type: ignore[attr-defined]
         self.send_response(200)
         self.send_header("Content-Type", "text/html; charset=utf-8")
         self.end_headers()
@@ -242,19 +558,25 @@ class _CallbackHandler(BaseHTTPRequestHandler):
             "Sign-in was cancelled or failed. Close this tab and try again from UEFN Ducky."
         )
         self.wfile.write(
-            f"<html><body style='font-family:sans-serif;padding:2rem'><h2>UEFN Ducky × Google "
-            f"Drive</h2><p>{msg}</p></body></html>".encode("utf-8")
+            f"<html><body style='font-family:sans-serif;padding:2rem'><h2>UEFN Ducky × Google"
+            f"</h2><p>{msg}</p></body></html>".encode("utf-8")
         )
 
     def log_message(self, *args: Any) -> None:  # silence per-request stderr noise
         return
 
 
-def _fetch_account_email(access_token: str) -> str:
+def _open_browser(url: str) -> bool:
+    import webbrowser
+
+    return bool(webbrowser.open(url))
+
+
+def _fetch_account_email(access: str) -> str:
     try:
         with _open(
             f"{ABOUT_URL}?fields=user(emailAddress,displayName)",
-            headers={"Authorization": f"Bearer {access_token}"},
+            headers={"Authorization": f"Bearer {access}"},
             timeout=20,
         ) as resp:
             data = json.loads(resp.read().decode("utf-8"))
@@ -264,51 +586,29 @@ def _fetch_account_email(access_token: str) -> str:
         return ""
 
 
-def _run_oauth_flow(timeout_s: float) -> dict[str, Any]:
-    """Loopback OAuth: open the user's browser, wait for the redirect, swap the code."""
-    client_id, client_secret = _oauth_client()
-    if not client_id or not client_secret:
-        raise ValueError(
-            "Google sign-in isn't set up in this build (no bundled client). You can "
-            "still use public share links (gdrive_download) with no login. To enable "
-            "one-click sign-in for private Drive, a Google Cloud 'Desktop app' OAuth "
-            "client must be configured — either bundled into the plugin, or pasted "
-            "under Settings → Google Drive → Advanced."
-        )
+def _loopback_consent(client_id: str, scopes: list[str], login_hint: str, timeout_s: float) -> dict[str, str]:
+    """Open Google's consent page and wait for the redirect → {code, verifier, redirect_uri}."""
     if not _CONNECT_LOCK.acquire(blocking=False):
-        raise ValueError("A Google Drive sign-in is already in progress — finish it in the browser")
+        raise ValueError("A Google sign-in is already in progress — finish it in the browser")
     try:
         server = HTTPServer(("127.0.0.1", 0), _CallbackHandler)
         server.oauth_result = None  # type: ignore[attr-defined]
         server.timeout = 1.0
-        port = server.server_address[1]
-        redirect_uri = f"http://127.0.0.1:{port}"
+        redirect_uri = f"http://127.0.0.1:{server.server_address[1]}"
         state = pysecrets.token_urlsafe(24)
-        verifier = pysecrets.token_urlsafe(64)[:100]
-        challenge = (
-            base64.urlsafe_b64encode(hashlib.sha256(verifier.encode("ascii")).digest())
-            .decode("ascii")
-            .rstrip("=")
+        verifier, challenge = pkce_pair()
+        auth_url = build_auth_url(
+            client_id=client_id,
+            redirect_uri=redirect_uri,
+            scopes=scopes,
+            state=state,
+            challenge=challenge,
+            login_hint=login_hint,
         )
-        auth_url = AUTH_URL + "?" + urllib.parse.urlencode(
-            {
-                "client_id": client_id,
-                "redirect_uri": redirect_uri,
-                "response_type": "code",
-                "scope": OAUTH_SCOPE,
-                "access_type": "offline",
-                "prompt": "consent",
-                "state": state,
-                "code_challenge": challenge,
-                "code_challenge_method": "S256",
-            }
-        )
-        import webbrowser
-
-        opened = webbrowser.open(auth_url)
-        log.info("gdrive oauth: browser opened=%s port=%s", opened, port)
-        deadline = time.monotonic() + max(30.0, min(timeout_s, 300.0))
         try:
+            opened = _open_browser(auth_url)
+            log.info("google sign-in: browser opened=%s", opened)
+            deadline = time.monotonic() + max(1.0, min(float(timeout_s or 0), CONNECT_TIMEOUT_MAX_S))
             while time.monotonic() < deadline and server.oauth_result is None:  # type: ignore[attr-defined]
                 server.handle_request()
             result = server.oauth_result  # type: ignore[attr-defined]
@@ -320,62 +620,132 @@ def _run_oauth_flow(timeout_s: float) -> dict[str, Any]:
                 f"visit this URL yourself, then retry: {auth_url}"
             )
         if result.get("error"):
+            if result["error"] == "access_denied":
+                raise ValueError("Google sign-in was cancelled — nothing was changed")
             raise ValueError(f"Google sign-in failed: {result['error']}")
         if result.get("state") != state:
             raise ValueError("OAuth state mismatch — sign-in rejected (possible tampering), try again")
         code = str(result.get("code") or "")
         if not code:
             raise ValueError("Google returned no auth code — try again")
-        token = _token_post(
-            {
-                "code": code,
-                "client_id": client_id,
-                "client_secret": client_secret,
-                "redirect_uri": redirect_uri,
-                "grant_type": "authorization_code",
-                "code_verifier": verifier,
-            }
-        )
-        access = str(token.get("access_token") or "")
-        if not access:
-            raise ValueError("Google returned no access token — check the OAuth client and retry")
-        email = _fetch_account_email(access)
-        _save_token(
-            {
-                "access_token": access,
-                "refresh_token": str(token.get("refresh_token") or ""),
-                "expires_at": time.time() + float(token.get("expires_in") or 3600) - 30.0,
-                "scope": str(token.get("scope") or OAUTH_SCOPE),
-                "email": email,
-                "obtained_at": time.time(),
-            }
-        )
-        log.info("gdrive oauth: connected as %s", email or "(email unknown)")
-        return {"account": email}
+        return {"code": code, "verifier": verifier, "redirect_uri": redirect_uri}
     finally:
         _CONNECT_LOCK.release()
 
 
+def connect(scopes: list[str] | None = None, account: str = "", timeout_s: float = 180.0) -> dict[str, Any]:
+    """Sign in a Google account, or add scopes to one (incremental consent).
+
+    Drive read access is always included; pass SCOPE_GMAIL / SCOPE_DRIVE to turn those on.
+    Returns {email, name, scopes, added, denied} — never tokens.
+    """
+    wanted = normalize_scopes([SCOPE_DRIVE_READ] + list(scopes or []))
+    existing = _find(_accounts(), account) if account else None
+    if existing:
+        wanted = normalize_scopes(normalize_scopes(existing.get("scopes")) + wanted)
+    via = "own" if _uses_own_client() else "broker"
+    client_id = _oauth_client()[0] if via == "own" else _broker_client_id()
+    got = _loopback_consent(client_id, wanted, str(account or "").strip(), timeout_s)
+    if via == "own":
+        client_id, client_secret = _oauth_client()
+        tokens = _token_post(
+            {
+                "code": got["code"],
+                "client_id": client_id,
+                "client_secret": client_secret,
+                "redirect_uri": got["redirect_uri"],
+                "grant_type": "authorization_code",
+                "code_verifier": got["verifier"],
+            }
+        )
+    else:
+        tokens = _broker_post(
+            "token",
+            {
+                "code": got["code"],
+                "code_verifier": got["verifier"],
+                "redirect_uri": got["redirect_uri"],
+                "client_id": client_id,
+            },
+        )
+    access = str(tokens.get("access_token") or "")
+    if not access:
+        raise ValueError("Google returned no access token — try signing in again")
+    granted = normalize_scopes(tokens.get("scope")) or wanted
+    email = _fetch_account_email(access) or str(account or "").strip() or "Google account"
+    with _STORE_LOCK:
+        accts = _accounts()
+        acct = _find(accts, email)
+        before = normalize_scopes(acct.get("scopes")) if acct else []
+        if acct is None:
+            acct = {"email": email, "name": ""}
+            accts.append(acct)
+        acct.update(
+            {
+                "scopes": granted,
+                "access_token": access,
+                "refresh_token": str(tokens.get("refresh_token") or acct.get("refresh_token") or ""),
+                "expires_at": time.time() + float(tokens.get("expires_in") or 3600) - 30.0,
+                "via": via,
+                "obtained_at": time.time(),
+            }
+        )
+        acct.pop("needs_sign_in", None)
+        _confirm_migration(acct)
+        _write_store(accts)
+    log.info("google sign-in: account connected (%d scopes, via %s)", len(granted), via)
+    return {
+        "email": email,
+        "name": str(acct.get("name") or ""),
+        "scopes": granted,
+        "added": [s for s in granted if s not in before],
+        "denied": [s for s in wanted if s not in granted],
+    }
+
+
+def _revoke_at_google(acct: dict[str, Any]) -> bool:
+    for field in ("refresh_token", "access_token"):
+        value = str(acct.get(field) or "")
+        if not value:
+            continue
+        try:
+            with _open(
+                REVOKE_URL,
+                data=urllib.parse.urlencode({"token": value}).encode("utf-8"),
+                method="POST",
+                headers={"Content-Type": "application/x-www-form-urlencoded"},
+                timeout=20,
+            ):
+                return True
+        except (urllib.error.URLError, ValueError):
+            continue
+    return False
+
+
+def disconnect(account: str, revoke: bool = True) -> bool:
+    """Revoke one account at Google (best effort) and forget it. True if Google took the revoke."""
+    with _STORE_LOCK:
+        accts = _accounts()
+        acct = _find(accts, account)
+        if acct is None:
+            raise ValueError(f"No connected Google account matches {account!r}")
+        revoked = _revoke_at_google(acct) if revoke else False
+        accts.remove(acct)
+        _confirm_migration(acct)
+        _write_store(accts)
+    return revoked
+
+
 def revoke_and_clear(revoke: bool = True) -> bool:
-    """Revoke the stored token at Google (best effort), then erase it. True if Google took it."""
-    tok = _load_token()
+    """Disconnect every account (and the 1.0.x key). True if Google took any revoke."""
     revoked = False
-    if revoke and tok:
-        for field in ("refresh_token", "access_token"):
-            value = str(tok.get(field) or "")
-            if not value:
-                continue
-            try:
-                with _open(
-                    REVOKE_URL,
-                    data=urllib.parse.urlencode({"token": value}).encode("utf-8"),
-                    method="POST",
-                    headers={"Content-Type": "application/x-www-form-urlencoded"},
-                    timeout=20,
-                ):
-                    revoked = True
-                break
-            except (urllib.error.URLError, ValueError):
-                continue
+    for acct in list_accounts():
+        revoked = disconnect(acct["email"], revoke=revoke) or revoked
     _clear_token()
     return revoked
+
+
+def _run_oauth_flow(timeout_s: float) -> dict[str, Any]:
+    """1.0.x entry point (gdrive_connect): sign in with Drive read access."""
+    res = connect([SCOPE_DRIVE_READ], "", timeout_s)
+    return {"account": res["email"]}

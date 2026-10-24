@@ -73,6 +73,7 @@ def _tool_json(payload: dict[str, Any], pretty: bool = False) -> str:
 
 def register(api: Any) -> None:
     """Wire the Google Drive tools into the app's shared MCP server."""
+    auth.bind(api)
 
     def _fail(exc: Exception, pretty: bool) -> str:
         return _tool_json({"ok": False, "error": str(exc) or exc.__class__.__name__}, pretty=pretty)
@@ -88,7 +89,7 @@ def register(api: Any) -> None:
         try:
             tok = _load_token()
             client_id, client_secret = _oauth_client()
-            sign_in_ready = bool(client_id and client_secret)
+            sign_in_ready = auth.sign_in_ready()
             api_key_set = bool(auth._get_secret(KEY_API))
             target_ref = _target_folder_ref()
             target_id = _target_folder_id()

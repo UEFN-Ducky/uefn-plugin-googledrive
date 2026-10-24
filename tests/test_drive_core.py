@@ -110,7 +110,8 @@ def test_status_signed_out(api):
     out = _call(api, "gdrive_status")
     assert out["ok"], out
     assert out["connected"] is False
-    assert out["sign_in_kind"] == "none"
+    assert out["sign_in_kind"] == "bundled"  # Google Connect: no own client in Settings
+    assert out["sign_in_ready"] is True
     assert out["access_modes"] == ["public"]
 
 

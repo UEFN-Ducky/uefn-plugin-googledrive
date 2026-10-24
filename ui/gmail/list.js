@@ -3,6 +3,8 @@
  * Every button runs the same panel RPC as the matching MCP tool (gmail_list, gmail_search,
  * gmail_labels_list, gmail_unread_count, gmail_mark_read, gmail_archive, gmail_trash…).
  * Opening a message emits "gmail:open" {id, threadId, account} for the reading pane.
+ * With several accounts the view starts on the Combined inbox: one page per account, merged
+ * newest first, a color dot per account (GW.accountColor), and paging per account.
  * Snippets, subjects and senders are mail data: always escaped, never run.
  */
 (function (root) {
@@ -231,7 +233,12 @@
 
   function renderSide() {
     const side = q(".gw-side");
+    const allDots = st.accounts.map((a) => `<span class="gw-dot" style="background:${GW.accountColor(a.email)}"></span>`).join("");
     const accts = st.accounts.length > 1 ? `<div class="gw-side__group" role="group" aria-label="Accounts">
+      <button type="button" class="gw-side__item gw-side__item--combined ${st.account ? "" : "is-on"}" data-account="" title="Mail from every connected account">
+        <span class="gw-side__dots" aria-hidden="true">${allDots}</span>
+        <span class="gw-side__name">Combined inbox</span>
+      </button>
       ${st.accounts.map((a) => `<button type="button" class="gw-side__item ${st.account === a.email ? "is-on" : ""}" data-account="${GW.esc(a.email)}">
         <span class="gw-dot" style="background:${GW.accountColor(a.email)}"></span>
         <span class="gw-side__name">${GW.esc(a.email)}</span>
@@ -489,7 +496,8 @@
     const before = st.accounts.map((a) => a.email).join(",");
     st.accounts = next;
     if (st.account && !next.some((a) => a.email === st.account)) st.account = "";
-    if (!st.account && next.length) st.account = next[0].email;
+    if (next.length === 1) st.account = next[0].email;
+    else if (before && before.split(",").length === 1 && st.account) st.account = "";
     if (!el) return;
     renderSide();
     if (before !== next.map((a) => a.email).join(",") || !st.loadedAt) {

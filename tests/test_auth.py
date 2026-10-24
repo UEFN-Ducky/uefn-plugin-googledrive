@@ -65,7 +65,7 @@ class Google:
             parsed = json.loads(body) if body.startswith("{") else dict(urllib.parse.parse_qsl(body))
         except ValueError:
             parsed = {}
-        self.requests.append({"url": url, "body": parsed})
+        self.requests.append({"url": url, "body": parsed, "headers": dict(headers or {})})
         granted = " ".join(self.auth_urls[-1]["scope"].split()) if self.auth_urls else READ
         if url.endswith("/collect/token"):  # Google Connect's answer: {ok, payload: {tokens}}
             tokens = {"access_token": "at1", "refresh_token": "rt1", "expires_in": 3600, "scope": granted}
@@ -138,7 +138,10 @@ def test_connect_via_google_connect_then_turn_on_gmail(env):
     assert g.auth_urls[0]["scope"] == READ  # Drive read only at first
     assert g.auth_urls[0]["client_id"] == "broker-client.apps.googleusercontent.com"
     assert g.auth_urls[0]["redirect_uri"].startswith("http://127.0.0.1:")
-    swap = [r for r in g.requests if r["url"].endswith("/collect/token")][0]["body"]
+    swap_req = [r for r in g.requests if r["url"].endswith("/collect/token")][0]
+    assert swap_req["headers"]["Origin"] == "https://uefnducky.org"
+    assert swap_req["headers"]["Content-Type"] == "application/json"
+    swap = swap_req["body"]
     assert swap["proof"].startswith("udp1_") and swap["code"] == "c1"
     challenge = base64.urlsafe_b64encode(hashlib.sha256(swap["code_verifier"].encode()).digest()).decode().rstrip("=")
     assert challenge == g.auth_urls[0]["code_challenge"]
@@ -187,6 +190,8 @@ def test_refresh_goes_through_google_connect(env):
     ref = [r for r in env["google"].requests if r["url"].endswith("/collect/refresh")]
     assert len(ref) == 1 and ref[0]["body"]["refresh_token"] == "rt1" and ref[0]["body"]["proof"]
     assert "client_secret" not in ref[0]["body"]
+    assert ref[0]["headers"]["Origin"] == "https://uefnducky.org"
+    assert ref[0]["headers"]["Content-Type"] == "application/json"
     assert auth.access_token_getter(ME)() == "at-fresh"  # still fresh: no second refresh
     assert len([r for r in env["google"].requests if r["url"].endswith("/collect/refresh")]) == 1
 

@@ -58,7 +58,8 @@ TOKEN_URL = "https://oauth2.googleapis.com/token"
 REVOKE_URL = "https://oauth2.googleapis.com/revoke"
 ABOUT_URL = "https://www.googleapis.com/drive/v3/about"
 
-BROKER_BASE = "https://uefnducky.org/api/v1/plugins/google-connect/collect"
+BROKER_ORIGIN = "https://uefnducky.org"
+BROKER_BASE = f"{BROKER_ORIGIN}/api/v1/plugins/google-connect/collect"
 BROKER_AUDIENCE = "google-connect"
 PROOF_TOOL = "account_session_token"
 # The Desktop app OAuth client whose secret Google Connect holds. A client id is public
@@ -292,7 +293,8 @@ def _broker_post(event: str, body: dict[str, Any]) -> dict[str, Any]:
             f"{BROKER_BASE}/{event}",
             data=json.dumps(payload).encode("utf-8"),
             method="POST",
-            headers={"Content-Type": "application/json", "Accept": "application/json"},
+            # Core refuses a collect POST without a same-site Origin (403 forbidden).
+            headers={"Content-Type": "application/json", "Accept": "application/json", "Origin": BROKER_ORIGIN},
             timeout=30,
         ) as resp:
             out = json.loads(resp.read().decode("utf-8") or "{}")

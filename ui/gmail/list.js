@@ -57,7 +57,7 @@
   let stopPoll = null;
   let rafPending = false;
 
-  const keyOf = (r) => `${r.account}\u0001${r.id}`;
+  const keyOf = (r) => `${r.account}|${r.id}`;
   const q = (sel) => el.querySelector(sel);
 
   function sender(r) {
@@ -534,7 +534,7 @@
     if (id) {
       const row = st.rows.find((x) => x.id === id || x.threadId === id);
       const acct = row ? row.account : (account || st.account);
-      st.active = `${acct}\u0001${row ? row.id : id}`;
+      st.active = `${acct}|${row ? row.id : id}`;
       if (row) scrollTo(st.active);
       GW.emit("gmail:open", { id: row ? row.id : id, threadId: row ? row.threadId : "", account: acct, message: row || null });
     }

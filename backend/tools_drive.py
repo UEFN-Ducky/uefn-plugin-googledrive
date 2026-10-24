@@ -12,39 +12,20 @@ Every change needs **Manage Drive** (the full ``drive`` scope) on that account; 
 read-only until the user turns it on. ``accounts()`` returns the connected accounts
 (``{email, drive, manage_drive}``, tools_account rows), ``token_for(email)`` an access
 token. Every request goes through ``http`` (default: auth.py's Google-only opener).
-
-No package-relative imports: siblings are loaded by file, so tests can load this alone.
 """
 
 from __future__ import annotations
 
 import functools
-import importlib.util
 import json
 import mimetypes
 import re
-import sys
 import urllib.error
 import urllib.parse
 from pathlib import Path
 from typing import Any, Callable, Iterable
 
-_HERE = Path(__file__).resolve().parent
-
-
-def _sibling(name: str) -> Any:
-    """``backend/<name>.py``, loaded once by file (the package may not be importable)."""
-    key = f"_googledrive_{name}"
-    mod = sys.modules.get(key)
-    if mod is None:
-        spec = importlib.util.spec_from_file_location(key, _HERE / f"{name}.py")
-        mod = importlib.util.module_from_spec(spec)
-        sys.modules[key] = mod
-        spec.loader.exec_module(mod)
-    return mod
-
-
-safety = _sibling("safety")
+from . import auth, safety
 
 API_BASE = "https://www.googleapis.com/drive/v3"
 UPLOAD_URL = "https://www.googleapis.com/upload/drive/v3/files"
@@ -167,7 +148,6 @@ def _lower_headers(headers: Any) -> dict[str, str]:
 def default_http(method: str, url: str, *, headers: dict[str, str] | None = None, data: bytes | None = None,
                  timeout: float = 60.0) -> tuple[int, dict[str, str], bytes]:
     """One request through auth.py's Google-only opener → (status, lower-case headers, body)."""
-    auth = _sibling("auth")
     try:
         with auth._open(url, headers=headers, data=data, method=method, timeout=timeout) as resp:
             return int(resp.status), _lower_headers(resp.headers), resp.read()

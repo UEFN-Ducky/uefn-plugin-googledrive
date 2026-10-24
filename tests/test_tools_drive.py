@@ -1,17 +1,20 @@
 """Drive manage tools over a fake Drive HTTP server: organize, inverses, trash, share, usage."""
 from __future__ import annotations
 
-import importlib.util
+import importlib
 import itertools
 import json
 import re
+import sys
+import types
 import urllib.parse
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-_spec = importlib.util.spec_from_file_location("gw_tools_drive", ROOT / "backend" / "tools_drive.py")
-td = importlib.util.module_from_spec(_spec)
-_spec.loader.exec_module(td)
+# backend/ as a bare package (its __init__ not run), so the relative imports resolve.
+_pkg = sys.modules.setdefault("gw_backend_pkg", types.ModuleType("gw_backend_pkg"))
+_pkg.__path__ = [str(ROOT / "backend")]
+td = importlib.import_module("gw_backend_pkg.tools_drive")
 
 ME = "me@example.com"
 WORK = "work@example.com"

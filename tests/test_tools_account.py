@@ -1,14 +1,16 @@
 """Account tools over a fake auth backend: status, connect (incremental), disconnect, aliases."""
 from __future__ import annotations
 
-import importlib.util
+import importlib
+import sys
 import types
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-_spec = importlib.util.spec_from_file_location("gw_tools_account", ROOT / "backend" / "tools_account.py")
-ta = importlib.util.module_from_spec(_spec)
-_spec.loader.exec_module(ta)
+# backend/ as a bare package (its __init__ not run), so the relative imports resolve.
+_pkg = sys.modules.setdefault("gw_backend_pkg", types.ModuleType("gw_backend_pkg"))
+_pkg.__path__ = [str(ROOT / "backend")]
+ta = importlib.import_module("gw_backend_pkg.tools_account")
 
 ME = "me@example.com"
 WORK = "work@example.com"

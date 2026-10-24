@@ -13,34 +13,16 @@
 The sign-in itself is auth.py's. ``AccountTools`` talks to it through a small backend
 (``list_accounts``, ``connect``, ``disconnect``, ``sign_in_ready``); ``ModuleAuth``
 adapts the auth module, so tests pass a fake backend instead.
-
-No package-relative imports: siblings are loaded by file, so tests can load this alone.
 """
 
 from __future__ import annotations
 
 import functools
-import importlib.util
-import sys
-from pathlib import Path
+import types
 from typing import Any, Callable, Iterable
 
-_HERE = Path(__file__).resolve().parent
-
-
-def _sibling(name: str) -> Any:
-    """``backend/<name>.py``, loaded once by file (the package may not be importable)."""
-    key = f"_googledrive_{name}"
-    mod = sys.modules.get(key)
-    if mod is None:
-        spec = importlib.util.spec_from_file_location(key, _HERE / f"{name}.py")
-        mod = importlib.util.module_from_spec(spec)
-        sys.modules[key] = mod
-        spec.loader.exec_module(mod)
-    return mod
-
-
-safety = _sibling("safety")
+from . import auth as auth_module
+from . import safety
 
 SCOPE_DRIVE_READ = "https://www.googleapis.com/auth/drive.readonly"
 SCOPE_DRIVE = "https://www.googleapis.com/auth/drive"
@@ -344,13 +326,13 @@ def register(api: Any, *, auth: Any = None, extra_status: Callable[[], dict[str,
     """Add the account tools (``@api.tool(listener=False)``) and their panel RPCs of the same name.
 
     auth: a backend with list_accounts / connect / disconnect / sign_in_ready, or the
-    auth module (wrapped in ModuleAuth); None loads backend/auth.py. extra_status():
+    auth module (wrapped in ModuleAuth); None uses backend/auth.py. extra_status():
     Drive details merged into google_status. aliases: also add the gdrive_* names.
     """
     if auth is None:
-        auth = _sibling("auth")
+        auth = auth_module
     if not callable(getattr(auth, "list_accounts", None)) or not callable(getattr(auth, "sign_in_ready", None)) \
-            or isinstance(auth, type(sys)):
+            or isinstance(auth, types.ModuleType):
         auth = ModuleAuth(auth)
     tools = AccountTools(api, auth=auth, extra_status=extra_status)
     for name in TOOL_NAMES + (ALIAS_NAMES if aliases else ()):

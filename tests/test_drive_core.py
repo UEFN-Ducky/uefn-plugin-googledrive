@@ -29,6 +29,7 @@ TOOLS = {
     "gdrive_download",
     "gdrive_import_to_uefn",
     "google_open",
+    "google_open_pending",
 }
 
 

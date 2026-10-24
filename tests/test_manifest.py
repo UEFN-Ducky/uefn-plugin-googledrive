@@ -71,6 +71,51 @@ def test_tab_panel_and_header_button():
     assert any(b["action"] == "panel:main" for b in buttons)
 
 
+def _props() -> dict:
+    return {p["id"]: p for s in CONTRIB["settings.sections"] for p in s["properties"]}
+
+
+def test_settings_tab_google():
+    tabs = CONTRIB["settings.tabs"]
+    assert [t["id"] for t in tabs] == ["Google"]
+    sections = CONTRIB["settings.sections"]
+    assert all(s["tab"] == "Google" for s in sections)
+    ids = [s["id"] for s in sections]
+    assert ids == ["accounts", "access", "gmail", "folder", "downloads", "advanced"]
+    orders = [s["order"] for s in sections]
+    assert orders == sorted(orders)
+
+
+def test_settings_properties():
+    props = _props()
+    # Off until the person turns them on: each adds its Google access only then.
+    assert props["gmail_enabled"]["type"] == "boolean" and props["gmail_enabled"]["default"] is False
+    assert props["manage_drive"]["type"] == "boolean" and props["manage_drive"]["default"] is False
+    assert props["gmail_load_remote_images"]["default"] is False
+    poll = {o["value"] for o in props["gmail_poll_seconds"]["options"]}
+    assert props["gmail_poll_seconds"]["default"] in poll and "0" in poll
+    days = {o["value"] for o in props["gmail_sync_days"]["options"]}
+    assert props["gmail_sync_days"]["default"] in days
+    # Existing users keep their values: old ids unchanged.
+    for old in ("target_folder", "max_download_mb", "gdrive_oauth_client_id",
+                "gdrive_oauth_client_secret", "gdrive_api_key"):
+        assert old in props, old
+
+
+def test_secret_fields_are_declared():
+    props = _props()
+    secrets = {pid for pid, p in props.items() if p["type"] == "secret"}
+    assert secrets == {"gdrive_oauth_client_id", "gdrive_oauth_client_secret", "gdrive_api_key"}
+    assert secrets <= set(MANIFEST["secret_keys"])
+
+
+def test_walkthrough_targets_google_tab():
+    walk = CONTRIB["walkthrough"]
+    assert walk["settings_tab"] == "Google"
+    assert all(step["target"] == "settings.tab.google" for step in walk["steps"])
+    assert "google-drive" not in json.dumps(walk)
+
+
 def test_no_secret_values_in_manifest():
     text = (ROOT / "plugin.json").read_text(encoding="utf-8")
     assert not re.search(r"GOCSPX-[A-Za-z0-9_-]{10,}", text)

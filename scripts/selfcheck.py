@@ -2,8 +2,9 @@
 """Dev self-check for the googledrive plugin backend (excluded from the shipped zip)."""
 import importlib.util, sys
 from pathlib import Path
-_spec = importlib.util.spec_from_file_location("gd_backend", Path(__file__).resolve().parents[1]/"backend"/"__init__.py")
-gd = importlib.util.module_from_spec(_spec); _spec.loader.exec_module(gd)
+_pkg = Path(__file__).resolve().parents[1]/"backend"
+_spec = importlib.util.spec_from_file_location("gd_backend", _pkg/"__init__.py", submodule_search_locations=[str(_pkg)])
+gd = importlib.util.module_from_spec(_spec); sys.modules["gd_backend"] = gd; _spec.loader.exec_module(gd)
 for _n in dir(gd):
     globals().setdefault(_n, getattr(gd, _n))
 

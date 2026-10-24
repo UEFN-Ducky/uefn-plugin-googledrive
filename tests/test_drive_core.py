@@ -20,6 +20,7 @@ auth = sys.modules["gd_core_backend.auth"]
 drive = sys.modules["gd_core_backend.drive"]
 
 OWN_TOOLS = {
+    "google_allowed_models",
     "gdrive_preview",
     "gdrive_list",
     "gdrive_search",
@@ -276,6 +277,21 @@ def test_preview_returns_a_media_url_for_a_picture(api, monkeypatch, tmp_path):
     assert not any("alt=media" in u for u, _b in google.calls[n:])  # cached: no second download
     refused = _call(api, "gdrive_preview", file=DOC_ID)
     assert refused["ok"] is False and "pictures only" in refused["error"]
+
+
+def test_allowed_models_rpc(api, monkeypatch):
+    # Host without a model gate (no api call, app module missing): empty list plus the reason.
+    monkeypatch.setitem(sys.modules, "backend.uefn_plugins.model_gate", None)
+    out = json.loads(api.rpcs["google_allowed_models"]())
+    assert out == {"ok": True, "models": [], "reason": "host has no model gate"}
+    # The app's model gate.
+    gate = type(sys)("model_gate")
+    gate.allowed_models = lambda pid: ["claude-opus-5-5"] if pid == "googledrive" else []
+    monkeypatch.setitem(sys.modules, "backend.uefn_plugins.model_gate", gate)
+    assert json.loads(api.rpcs["google_allowed_models"]()) == {"ok": True, "models": ["claude-opus-5-5"]}
+    # A host api that offers it wins.
+    api.allowed_models = lambda pid: ["gpt-6-luna"]
+    assert gd.allowed_models(api) == {"ok": True, "models": ["gpt-6-luna"]}
 
 
 def test_download_goes_through_drive(api, monkeypatch, tmp_path):

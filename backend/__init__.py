@@ -103,6 +103,22 @@ def _drive_status() -> dict[str, Any]:
     return out
 
 
+def allowed_models(api: Any) -> dict[str, Any]:
+    """The models Settings allows for this plugin (Draft with AI / Ask Ducky use only these).
+
+    Read from the host api when it offers ``allowed_models``, else from the app's model
+    gate; a host without either answers ``{models: [], reason}``.
+    """
+    fn = getattr(api, "allowed_models", None)
+    try:
+        if callable(fn):
+            return {"ok": True, "models": [str(m) for m in fn(PLUGIN_ID) or []]}
+        from backend.uefn_plugins.model_gate import allowed_models as gate_models
+    except ImportError:
+        return {"ok": True, "models": [], "reason": "host has no model gate"}
+    return {"ok": True, "models": [str(m) for m in gate_models(PLUGIN_ID) or []]}
+
+
 def _poll_seconds() -> Any:
     from .drive import _prefs
 
@@ -431,6 +447,19 @@ def register(api: Any) -> None:
     # The Drive tab calls the same functions as panel RPCs.
     for _rpc in (gdrive_list, gdrive_search, gdrive_file_info, gdrive_import_to_uefn, gdrive_preview):
         api.register_panel_rpc(_rpc.__name__, _rpc)
+
+    @api.tool(listener=False)
+    def google_allowed_models(pretty: bool = False) -> str:
+        """Models allowed to read this plugin's mail and files (Settings → Allowed models).
+
+        Returns {ok, models}; an empty list means no model may draft with Gmail data.
+        """
+        try:
+            return _tool_json(allowed_models(api), pretty=pretty)
+        except Exception as exc:  # noqa: BLE001
+            return _fail(exc, pretty)
+
+    api.register_panel_rpc("google_allowed_models", google_allowed_models)
 
     display.register(api)
 

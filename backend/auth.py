@@ -10,8 +10,8 @@ Who holds the client secret:
     and every refresh go through ``POST {BROKER_BASE}/token`` / ``/refresh`` with a
     UEFN Ducky sign-in proof from the Account plugin
     (``api.call_tool("account_session_token", {"audience": "google-connect"})``).
-    ``POST {BROKER_BASE}/config`` gives the public client id. Answers are
-    ``{ok, payload}`` with Google's token fields in ``payload`` (or ``payload.tokens``).
+    The public client id ships here (``GOOGLE_CONNECT_CLIENT_ID``). Answers are
+    ``{ok, payload: {tokens}}``; ``google_reauth_required`` means sign in again.
   - **Your own client** (Settings → Advanced: client id + secret): Google Connect is
     skipped and the plugin talks to Google's token endpoint itself.
 
@@ -61,6 +61,9 @@ ABOUT_URL = "https://www.googleapis.com/drive/v3/about"
 BROKER_BASE = "https://uefnducky.org/api/v1/plugins/google-connect/collect"
 BROKER_AUDIENCE = "google-connect"
 PROOF_TOOL = "account_session_token"
+# The Desktop app OAuth client whose secret Google Connect holds. A client id is public
+# (it is in every sign-in URL); empty until that Google Cloud client exists.
+GOOGLE_CONNECT_CLIENT_ID = ""
 
 CONNECT_TIMEOUT_MAX_S = 300.0
 
@@ -78,7 +81,6 @@ _ALLOWED_HOSTS = {
 _CONNECT_LOCK = threading.Lock()
 _STORE_LOCK = threading.RLock()
 _API: Any = None
-_broker_client_id_cache = ""
 
 
 def bind(api: Any) -> None:
@@ -224,6 +226,11 @@ _INVALID_GRANT_MSG = (
     "Google rejected the saved sign-in (invalid_grant) — it was revoked or expired. "
     "Sign in again with google_connect."
 )
+_REAUTH_MARKERS = ("invalid_grant", "google_reauth_required")
+
+
+def _needs_reauth(text: str) -> bool:
+    return any(m in text for m in _REAUTH_MARKERS)
 
 
 def _token_post(form: dict[str, str]) -> dict[str, Any]:
@@ -277,10 +284,9 @@ def _session_proof() -> str:
     return proof
 
 
-def _broker_post(event: str, body: dict[str, Any], *, proof: bool = True) -> dict[str, Any]:
+def _broker_post(event: str, body: dict[str, Any]) -> dict[str, Any]:
     payload = dict(body)
-    if proof:
-        payload["proof"] = _session_proof()
+    payload["proof"] = _session_proof()
     try:
         with _open(
             f"{BROKER_BASE}/{event}",
@@ -292,7 +298,7 @@ def _broker_post(event: str, body: dict[str, Any], *, proof: bool = True) -> dic
             out = json.loads(resp.read().decode("utf-8") or "{}")
     except urllib.error.HTTPError as exc:
         detail = _http_error_detail(exc)
-        if "invalid_grant" in detail:
+        if _needs_reauth(detail):
             raise ValueError(_INVALID_GRANT_MSG) from exc
         if exc.code == 401:
             raise ValueError(
@@ -307,7 +313,7 @@ def _broker_post(event: str, body: dict[str, Any], *, proof: bool = True) -> dic
         raise ValueError("Google Connect sent an unexpected answer")
     if out.get("ok") is False or out.get("error"):
         err = str(out.get("error") or "request failed")
-        if "invalid_grant" in err:
+        if _needs_reauth(err):
             raise ValueError(_INVALID_GRANT_MSG)
         raise ValueError(f"Google Connect: {err[:300]}")
     result = out.get("payload", out)
@@ -317,14 +323,12 @@ def _broker_post(event: str, body: dict[str, Any], *, proof: bool = True) -> dic
 
 
 def _broker_client_id() -> str:
-    global _broker_client_id_cache
-    if not _broker_client_id_cache:
-        cfg = _broker_post("config", {}, proof=False)
-        cid = str(cfg.get("clientId") or cfg.get("client_id") or "").strip()
-        if not cid:
-            raise ValueError("Google sign-in on uefnducky.org isn't switched on yet — try again later")
-        _broker_client_id_cache = cid
-    return _broker_client_id_cache
+    if not GOOGLE_CONNECT_CLIENT_ID:
+        raise ValueError(
+            "One-click Google sign-in isn't set up in this build yet. Use your own OAuth "
+            "client in Settings → Google → Advanced, or public share links with gdrive_download."
+        )
+    return GOOGLE_CONNECT_CLIENT_ID
 
 
 # --------------------------------------------------------------------------- #
@@ -344,11 +348,11 @@ def _uses_own_client() -> bool:
 
 def _using_bundled_client() -> bool:
     """True when sign-in goes through Google Connect (no own client set in Settings)."""
-    return not _uses_own_client() and _API is not None
+    return not _uses_own_client() and _API is not None and bool(GOOGLE_CONNECT_CLIENT_ID)
 
 
 def sign_in_ready() -> bool:
-    return _uses_own_client() or _API is not None
+    return _uses_own_client() or (_API is not None and bool(GOOGLE_CONNECT_CLIENT_ID))
 
 
 def _legacy_token() -> dict[str, Any] | None:

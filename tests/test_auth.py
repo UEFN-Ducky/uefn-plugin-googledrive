@@ -56,6 +56,7 @@ class Google:
         self.redirect: dict = {}
         self.refresh_answer: dict = {"access_token": "at-fresh", "expires_in": 3600}
         self.email = ME
+        self.broker_refresh: dict | None = None
 
     def open(self, url, *, headers=None, data=None, method=None, timeout=60.0):
         _CHECK_URL(url)  # every request must pass the real host allowlist
@@ -66,12 +67,11 @@ class Google:
             parsed = {}
         self.requests.append({"url": url, "body": parsed})
         granted = " ".join(self.auth_urls[-1]["scope"].split()) if self.auth_urls else READ
-        if url.endswith("/collect/config"):
-            return Resp({"ok": True, "payload": {"clientId": "broker-client.apps.googleusercontent.com"}})
-        if url.endswith("/collect/token"):
-            return Resp({"ok": True, "payload": {"access_token": "at1", "refresh_token": "rt1", "expires_in": 3600, "scope": granted}})
+        if url.endswith("/collect/token"):  # Google Connect's answer: {ok, payload: {tokens}}
+            tokens = {"access_token": "at1", "refresh_token": "rt1", "expires_in": 3600, "scope": granted}
+            return Resp({"ok": True, "payload": {"tokens": tokens}})
         if url.endswith("/collect/refresh"):
-            return Resp({"ok": True, "payload": self.refresh_answer})
+            return Resp(self.broker_refresh or {"ok": True, "payload": {"tokens": self.refresh_answer}})
         if url == auth.TOKEN_URL:
             if parsed.get("grant_type") == "refresh_token":
                 return Resp(self.refresh_answer)
@@ -104,7 +104,7 @@ def env(monkeypatch):
     monkeypatch.setattr(auth, "_set_secret", lambda k, v: secrets.__setitem__(k, v))
     monkeypatch.setattr(auth, "_open", google.open)
     monkeypatch.setattr(auth, "_open_browser", google.browser)
-    monkeypatch.setattr(auth, "_broker_client_id_cache", "")
+    monkeypatch.setattr(auth, "GOOGLE_CONNECT_CLIENT_ID", "broker-client.apps.googleusercontent.com")
     api = FakeApi()
     auth.bind(api)
     yield {"secrets": secrets, "google": google, "api": api}
@@ -199,13 +199,19 @@ def test_scope_check_and_invalid_grant(env, monkeypatch):
     accts[0]["expires_at"] = 0
     env["secrets"][auth.KEY_ACCOUNTS] = json.dumps({"version": 1, "accounts": accts})
 
-    def revoked(event, body, proof=True):
-        raise ValueError(auth._INVALID_GRANT_MSG)
-
-    monkeypatch.setattr(auth, "_broker_post", revoked)
+    env["google"].broker_refresh = {"ok": False, "error": "google_reauth_required"}  # Google Connect's word for it
     with pytest.raises(ValueError, match="invalid_grant"):
         auth.access_token(ME)
     assert auth.list_accounts()[0]["needs_sign_in"] is True
+    assert auth.gmail_accounts() == [] and auth._load_token() is None
+
+
+def test_build_without_client_id_says_so(env, monkeypatch):
+    monkeypatch.setattr(auth, "GOOGLE_CONNECT_CLIENT_ID", "")
+    assert auth.sign_in_ready() is False and auth._using_bundled_client() is False
+    with pytest.raises(ValueError, match="isn't set up in this build"):
+        auth.connect(timeout_s=10)
+    assert env["google"].requests == [] and env["google"].auth_urls == []
 
 
 def test_no_ducky_sign_in_means_no_google_sign_in(env):

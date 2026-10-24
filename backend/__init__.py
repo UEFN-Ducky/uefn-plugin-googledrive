@@ -478,6 +478,11 @@ def _oauth_client() -> tuple[str, str]:
     return _get_secret(KEY_CLIENT_ID).strip(), _get_secret(KEY_CLIENT_SECRET).strip()
 
 
+def _using_bundled_client() -> bool:
+    """True when sign-in runs on a client shipped with the plugin (none ships today)."""
+    return False
+
+
 def _load_token() -> dict[str, Any] | None:
     raw = _get_secret(KEY_TOKEN)
     if not raw:
@@ -1057,7 +1062,7 @@ def register(api: Any) -> None:
     def _fail(exc: Exception, pretty: bool) -> str:
         return _tool_json({"ok": False, "error": str(exc) or exc.__class__.__name__}, pretty=pretty)
 
-    @api.tool(intent=r"\b(google\s*drive|gdrive|drive\.google|drive\s+(link|folder|file))\b")
+    @api.tool(intent=r"\b(google\s*drive|gdrive|drive\.google|drive\s+(link|folder|file))\b", listener=False)
     def gdrive_status(pretty: bool = False) -> str:
         """Google Drive plugin status: access modes, connected account, staging folder.
 
@@ -1128,7 +1133,7 @@ def register(api: Any) -> None:
         except Exception as exc:  # noqa: BLE001 — never raise across the MCP bridge
             return _fail(exc, pretty)
 
-    @api.tool()
+    @api.tool(listener=False)
     def gdrive_connect(timeout_s: float = 180.0, pretty: bool = False) -> str:
         """Sign in with Google (read-only Drive scope) via one-click browser sign-in.
 
@@ -1158,7 +1163,7 @@ def register(api: Any) -> None:
         except Exception as exc:  # noqa: BLE001
             return _fail(exc, pretty)
 
-    @api.tool()
+    @api.tool(listener=False)
     def gdrive_disconnect(revoke: bool = True, pretty: bool = False) -> str:
         """Disconnect Google Drive: revoke the token at Google (best effort) and erase it."""
         try:
@@ -1194,7 +1199,7 @@ def register(api: Any) -> None:
         except Exception as exc:  # noqa: BLE001
             return _fail(exc, pretty)
 
-    @api.tool()
+    @api.tool(listener=False)
     def gdrive_list(
         folder: str = "",
         page_size: int = 50,
@@ -1215,7 +1220,7 @@ def register(api: Any) -> None:
         except Exception as exc:  # noqa: BLE001
             return _fail(exc, pretty)
 
-    @api.tool()
+    @api.tool(listener=False)
     def gdrive_search(
         query: str,
         folder: str = "",
@@ -1244,7 +1249,7 @@ def register(api: Any) -> None:
         except Exception as exc:  # noqa: BLE001
             return _fail(exc, pretty)
 
-    @api.tool()
+    @api.tool(listener=False)
     def gdrive_file_info(file: str, pretty: bool = False) -> str:
         """Metadata for one Drive file (name, size, type, importability) before downloading.
 
@@ -1288,7 +1293,7 @@ def register(api: Any) -> None:
         except Exception as exc:  # noqa: BLE001
             return _fail(exc, pretty)
 
-    @api.tool()
+    @api.tool(listener=False)
     def gdrive_download(
         file: str,
         filename: str = "",
@@ -1448,14 +1453,24 @@ def register(api: Any) -> None:
         except Exception as exc:  # noqa: BLE001
             return _fail(exc, pretty)
 
+    @api.register_pipeline_node("googledrive.list")
+    def node_list(ctx: dict) -> dict:
+        cfg = {**(ctx.get("config") or {}), **(ctx.get("inputs") or {})}
+        try:
+            data = list_drive(str(cfg.get("folder") or ""), query=str(cfg.get("query") or ""))
+            return {"ok": True, "files": data["files"], "count": len(data["files"])}
+        except Exception as exc:  # noqa: BLE001
+            return {"ok": False, "error": str(exc) or exc.__class__.__name__}
+
+    @api.register_pipeline_node("googledrive.download")
+    def node_download(ctx: dict) -> dict:
+        cfg = {**(ctx.get("config") or {}), **(ctx.get("inputs") or {})}
+        try:
+            if not str(cfg.get("file") or "").strip():
+                raise ValueError("Pass a Drive share link or file id in 'file'")
+            result = download_to_staging(str(cfg["file"]), extract_archives=True)
+            return {"ok": True, "path": result["path"], "result": result}
+        except Exception as exc:  # noqa: BLE001
+            return {"ok": False, "error": str(exc) or exc.__class__.__name__}
+
     api.log("Google Drive tools registered")
-
-
-# --------------------------------------------------------------------------- #
-# Standalone self-check: py plugins/uefn-plugin-googledrive/backend/__init__.py
-
-if __name__ == "__main__":
-    import runpy, pathlib
-    selfcheck = pathlib.Path(__file__).resolve().parents[1] / "scripts" / "selfcheck.py"
-    if selfcheck.is_file():  # a compiled build ships no scripts/
-        runpy.run_path(str(selfcheck), run_name="__main__")

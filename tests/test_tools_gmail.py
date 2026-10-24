@@ -525,6 +525,83 @@ def test_system_labels_cannot_be_deleted(tmp_path):
         tools.gmail_label_delete("INBOX", confirmed=True)
 
 
+# ── accounts ───────────────────────────────────────────────────────────────
+
+
+def two_accounts(tmp_path):
+    home = FakeGmail(ME, [gmail_message("h1", subject="Logo home", date_ms=100),
+                          gmail_message("h2", subject="Logo old", date_ms=10)])
+    work = FakeGmail(WORK, [gmail_message("w1", subject="Logo work", date_ms=50, to=WORK)])
+    tools, api = make(home, work, tmp_path=tmp_path)
+    return tools, api, home, work
+
+
+def test_search_merges_both_accounts_newest_first_and_tags_rows(tmp_path):
+    tools, _, _, _ = two_accounts(tmp_path)
+    out = tools.gmail_search("logo")
+    assert [(m["id"], m["account"]) for m in out["messages"]] == [("h1", ME), ("w1", WORK), ("h2", ME)]
+    assert out["accounts"] == [ME, WORK]
+    assert "account=work%40example.com" in out["display"]  # each row opens in its own account
+    only = tools.gmail_search("logo", account="WORK@example.com")
+    assert [m["id"] for m in only["messages"]] == ["w1"]
+
+
+def test_list_and_counts_cover_every_account(tmp_path):
+    tools, _, _, _ = two_accounts(tmp_path)
+    assert {m["account"] for m in tools.gmail_list()["messages"]} == {ME, WORK}
+    counts = tools.gmail_unread_count()
+    assert counts["by_account"] == {ME: 2, WORK: 1} and counts["unread"] == 3
+    assert {lab["account"] for lab in tools.gmail_labels_list()["labels"]} == {ME, WORK}
+
+
+def test_get_finds_the_message_in_whichever_account_has_it(tmp_path):
+    tools, _, _, _ = two_accounts(tmp_path)
+    out = tools.gmail_get("w1")
+    assert out["account"] == WORK and out["message"]["account"] == WORK
+
+
+def test_one_failing_account_does_not_sink_a_merged_read(tmp_path):
+    tools, _, _, work = two_accounts(tmp_path)
+
+    def down(*_a, **_k):
+        raise tg.gmail.GmailError("token expired", status=401)
+
+    work.list_messages = down
+    out = tools.gmail_search("logo")
+    assert [m["id"] for m in out["messages"]] == ["h1", "h2"]
+    assert out["account_errors"] == {WORK: "token expired"}
+
+
+def test_ambiguous_send_is_refused_and_nothing_is_sent(tmp_path):
+    tools, api, home, work = two_accounts(tmp_path)
+    tg_api = FakeApi(tmp_path)
+    tg.register(tg_api, accounts=lambda: [ME, WORK], client_for=lambda a: {ME: home, WORK: work}[a])
+    for name, args in [
+        ("gmail_send", {"to": "lee@example.com", "subject": "Hi", "body": "Yo"}),
+        ("gmail_reply", {"id": "h1", "body": "Yo"}),
+        ("gmail_archive", {"ids": ["h1"]}),
+        ("gmail_trash", {"ids": ["h1"], "confirmed": True}),
+    ]:
+        out = tg_api.rpcs[name](**args)
+        assert out["ok"] is False and "Several Google accounts" in out["error"], name
+    assert home.sent == work.sent == [] and "INBOX" in labels_of(home, "h1")
+    named = tools.gmail_send("lee@example.com", "Hi", "Yo", account=WORK)
+    assert named["account"] == WORK and len(work.sent) == 1 and home.sent == []
+    assert sent_headers(work)["from"]["email"] == WORK
+
+
+def test_unknown_account_is_refused(tmp_path):
+    tools, _, _, _ = two_accounts(tmp_path)
+    with pytest.raises(tg.ToolError, match="not a connected Google account"):
+        tools.gmail_list(account="stranger@example.com")
+
+
+def test_no_account_with_gmail_on_says_so(tmp_path):
+    tools, _ = make(tmp_path=tmp_path)
+    with pytest.raises(tg.ToolError, match="turn on Gmail"):
+        tools.gmail_list()
+
+
 def test_safe_filename_strips_paths_and_reserved_names():
     assert tg.safe_filename("../../evil/con.txt") == "_con.txt"
     assert tg.safe_filename('a<b>:"c.png') == "a_b___c.png"

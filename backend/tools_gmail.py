@@ -10,6 +10,9 @@ agent run the same code.
   - Write: drafts, send, reply, forward. Sending tools are ``destructive_tools`` in
     plugin.json, so Ducky asks the person before each call; every write is recorded
     in the Changes ledger (a sent mail can't be unsent, so those are manual).
+  - Accounts: every tool takes an optional ``account`` (email). Empty: reads cover every
+    connected account, merged newest first and tagged with their account; writes refuse
+    when several are connected, so nothing goes out from the wrong address.
   - Organize: labels, read/unread, archive, star with inverses that undo exactly what
     changed (archive ↔ add INBOX); trash and label delete go through safety.py
     (preview until confirmed, trash only, 50 at most).
@@ -192,15 +195,28 @@ class GmailTools:
         return ToolError("No Google account has Gmail turned on: sign in and turn on Gmail first.")
 
     def read_accounts(self, account: str = "") -> list[str]:
-        """Accounts a read covers: the named one, else the only one."""
+        """Accounts a read covers: the named one, else every connected one."""
         if _str(account):
             return [self._named(account)]
         accts = self.accounts()
         if not accts:
             raise self._no_accounts()
-        if len(accts) > 1:
-            raise ToolError(f"Several Google accounts are connected ({', '.join(accts)}): name one with account=.")
         return accts
+
+    def _each(self, accts: list[str], fn: Callable[[str], Any]) -> tuple[list[tuple[str, Any]], dict[str, str]]:
+        """Run ``fn(account)`` per account; with several, one failing account doesn't sink the rest."""
+        done: list[tuple[str, Any]] = []
+        errors: dict[str, str] = {}
+        for acct in accts:
+            try:
+                done.append((acct, fn(acct)))
+            except (gmail.GmailError, ToolError) as exc:
+                if len(accts) == 1:
+                    raise
+                errors[acct] = str(exc) or exc.__class__.__name__
+        if not done and errors:
+            raise ToolError("; ".join(f"{a}: {e}" for a, e in errors.items()))
+        return done, errors
 
     def client(self, account: str) -> Any:
         return self._client_for(account)
@@ -210,15 +226,16 @@ class GmailTools:
         if not _str(message_id):
             raise ToolError("id is required")
         last: Exception | None = None
-        for acct in self.read_accounts(account):
+        accts = self.read_accounts(account)
+        for acct in accts:
             c = self.client(acct)
             try:
                 found = c.get_thread(message_id, "full") if thread else c.get_message(message_id, "full")
                 return acct, c, found or {}
             except gmail.GmailError as exc:
-                if exc.status not in (400, 404):
+                if exc.status not in (400, 404) and len(accts) == 1:
                     raise
-                last = exc
+                last = exc  # not in this account (or it is down): try the next one
         kind = "thread" if thread else "message"
         raise ToolError(f"No {kind} {message_id} in {account or 'the connected accounts'}.") from last
 
@@ -257,7 +274,9 @@ class GmailTools:
         tokens: dict[str, str] = {}
         estimate = 0
         accts = self.read_accounts(account)
-        for acct in accts:
+
+        def one(acct: str) -> None:
+            nonlocal estimate
             c = self.client(acct)
             ids = label_ids(c) if callable(label_ids) else label_ids
             page = c.list_messages(q=q, max=want, label_ids=ids, page_token=page_token if len(accts) == 1 else "")
@@ -265,6 +284,8 @@ class GmailTools:
             if page.get("nextPageToken"):
                 tokens[acct] = str(page["nextPageToken"])
             estimate += int(page.get("resultSizeEstimate") or 0)
+
+        _done, errors = self._each(accts, one)
         rows.sort(key=_sort_key, reverse=True)
         out: dict[str, Any] = {
             "ok": True,
@@ -274,7 +295,9 @@ class GmailTools:
             "next_page_token": tokens.get(accts[0], "") if len(accts) == 1 else "",
         }
         if len(accts) > 1:
-            out["next_page_tokens"] = tokens
+            out["next_page_tokens"] = tokens  # page one account further with account= + page_token
+        if errors:
+            out["account_errors"] = errors
         if estimate:
             out["total_estimate"] = estimate
         return out
@@ -365,20 +388,29 @@ class GmailTools:
 
     def gmail_labels_list(self, account: str = "") -> dict[str, Any]:
         """Gmail labels (system and your own) with their ids, per account."""
-        labels = []
-        for acct in self.read_accounts(account):
-            for lab in self.client(acct).list_labels():
-                labels.append({"id": lab.get("id"), "name": lab.get("name"), "type": lab.get("type"), "account": acct})
-        return {"ok": True, "labels": labels, "count": len(labels)}
+        done, errors = self._each(self.read_accounts(account), lambda acct: self.client(acct).list_labels())
+        labels = [
+            {"id": lab.get("id"), "name": lab.get("name"), "type": lab.get("type"), "account": acct}
+            for acct, rows in done for lab in rows
+        ]
+        out: dict[str, Any] = {"ok": True, "labels": labels, "count": len(labels)}
+        if errors:
+            out["account_errors"] = errors
+        return out
 
     def gmail_unread_count(self, label: str = "INBOX", account: str = "") -> dict[str, Any]:
         """Unread messages in a label (default INBOX). Returns {ok, unread, by_account}."""
-        by_account: dict[str, int] = {}
-        for acct in self.read_accounts(account):
+        def one(acct: str) -> int:
             c = self.client(acct)
-            info = c.get_label(self.label_id(c, _str(label) or "INBOX")) or {}
-            by_account[acct] = int(info.get("messagesUnread") or 0)
-        return {"ok": True, "label": _str(label) or "INBOX", "unread": sum(by_account.values()), "by_account": by_account}
+            return int((c.get_label(self.label_id(c, _str(label) or "INBOX")) or {}).get("messagesUnread") or 0)
+
+        done, errors = self._each(self.read_accounts(account), one)
+        by_account = dict(done)
+        out: dict[str, Any] = {"ok": True, "label": _str(label) or "INBOX", "unread": sum(by_account.values()),
+                               "by_account": by_account}
+        if errors:
+            out["account_errors"] = errors
+        return out
 
     def _cached(self, account: str, message_id: str) -> dict[str, Any] | None:
         if self._store_for is None:
@@ -591,13 +623,16 @@ class GmailTools:
         """List drafts (optionally a Gmail query over them). Returns {ok, drafts: [{draft_id, id, to, subject…}]}."""
         want = _count(max_results)
         drafts: list[dict[str, Any]] = []
-        for acct in self.read_accounts(account):
+
+        def one(acct: str) -> None:
             c = self.client(acct)
             for d in (c.list_drafts(q=_str(query), max=want) or {}).get("drafts") or []:
                 full = c.get_draft(d.get("id"), "metadata") or {}
                 r = row(full.get("message") or {}, acct)
                 r["draft_id"] = _str(d.get("id"))
                 drafts.append(r)
+
+        self._each(self.read_accounts(account), one)
         drafts.sort(key=_sort_key, reverse=True)
         out = {"ok": True, "drafts": drafts[:want], "count": len(drafts[:want])}
         return display.with_display(out, display.messages_markdown(out["drafts"], title="Drafts", account=_str(account)))

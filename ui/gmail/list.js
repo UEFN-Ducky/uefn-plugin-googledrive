@@ -500,7 +500,7 @@
     else if (before && before.split(",").length === 1 && st.account) st.account = "";
     if (!el) return;
     renderSide();
-    if (before !== next.map((a) => a.email).join(",") || !st.loadedAt) {
+    if (before !== next.map((a) => a.email).join(",") || !st.gen) {
       resetList();
       refresh();
     }

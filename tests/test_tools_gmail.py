@@ -139,6 +139,32 @@ class FakeGmail:
     def list_drafts(self, q="", max=20, *, page_token=""):
         return {"drafts": [{"id": d} for d in list(self.drafts)[:max]], "ids": list(self.drafts)[:max]}
 
+    def batch_modify(self, ids, add=None, remove=None):
+        self.calls.append(("batch_modify", tuple(ids), tuple(add or ()), tuple(remove or ())))
+        for mid in ids:
+            labels = self._need(mid)["labelIds"]
+            labels[:] = [x for x in labels if x not in (remove or [])] + [x for x in add or [] if x not in labels]
+        return {"ok": True, "count": len(ids)}
+
+    def trash_message(self, mid):
+        m = self._need(mid)
+        m["labelIds"] = [x for x in m["labelIds"] if x != "INBOX"] + ["TRASH"]
+        return m
+
+    def untrash_message(self, mid):
+        m = self._need(mid)
+        m["labelIds"] = [x for x in m["labelIds"] if x != "TRASH"] + ["INBOX"]
+        return m
+
+    def create_label(self, name, **_kw):
+        lab = {"id": f"Label_{next(self._ids)}", "name": name, "type": "user"}
+        self.labels.append(lab)
+        return lab
+
+    def delete_label(self, lid):
+        self.labels = [lab for lab in self.labels if lab["id"] != lid]
+        return {"ok": True, "id": lid}
+
     def send_draft(self, did):
         draft = self.drafts.pop(did)
         self.sent.append({"id": draft["message"]["id"], "draft": did})
@@ -393,6 +419,110 @@ def test_drafts_create_reply_update_list_and_send(tmp_path):
     sent = tools.gmail_draft_send(did)
     assert sent["sent"] and client.sent[-1]["draft"] == did
     assert [r["command"] for r in api.changeset.records] == ["gmail_draft_create", "gmail_draft_update", "gmail_draft_send"]
+
+
+# ── organize ───────────────────────────────────────────────────────────────
+
+
+def revert(tools, record):
+    """Run a changeset's inverse the way the Changes tab does: each entry is a tool call."""
+    for step in record["inverse"]:
+        out = getattr(tools, step["command"])(**step["params"])
+        assert out["ok"], out
+
+
+def labels_of(client, mid):
+    return set(client.messages[mid]["labelIds"])
+
+
+def test_archive_then_revert_puts_it_back_in_the_inbox(tmp_path):
+    client = FakeGmail(messages=[gmail_message("m1"), gmail_message("m2", labels=("Label_1",))])
+    tools, api = make(client, tmp_path=tmp_path)
+    out = tools.gmail_archive(["m1", "m2"])
+    assert out["changed"] == 1  # m2 was not in the Inbox
+    assert "INBOX" not in labels_of(client, "m1")
+    rec = api.changeset.records[-1]
+    assert rec["revertable"] == "auto" and rec["inverse"] == [
+        {"command": "gmail_modify", "params": {"ids": ["m1"], "add_labels": ["INBOX"], "remove_labels": [], "account": ME}}
+    ]
+    revert(tools, rec)
+    assert "INBOX" in labels_of(client, "m1") and "INBOX" not in labels_of(client, "m2")
+
+
+def test_modify_by_label_name_inverts_only_real_changes(tmp_path):
+    client = FakeGmail(messages=[gmail_message("m1"), gmail_message("m2", labels=("INBOX", "Label_1"))])
+    tools, api = make(client, tmp_path=tmp_path)
+    tools.gmail_modify("m1, m2", add_labels=["Receipts"], remove_labels="UNREAD")
+    assert labels_of(client, "m1") == {"INBOX", "Label_1"} and labels_of(client, "m2") == {"INBOX", "Label_1"}
+    revert(tools, api.changeset.records[-1])
+    assert labels_of(client, "m1") == {"INBOX", "UNREAD"}
+    assert labels_of(client, "m2") == {"INBOX", "Label_1"}  # it had Receipts before: kept
+
+
+def test_no_change_records_nothing(tmp_path):
+    client = FakeGmail(messages=[gmail_message("m1", labels=("INBOX",))])
+    tools, api = make(client, tmp_path=tmp_path)
+    assert tools.gmail_mark_read(["m1"])["changed"] == 0 and api.changeset.records == []
+
+
+def test_read_unread_star_unstar(tmp_path):
+    client = FakeGmail(messages=[gmail_message("m1")])
+    tools, _ = make(client, tmp_path=tmp_path)
+    tools.gmail_mark_read(["m1"])
+    assert "UNREAD" not in labels_of(client, "m1")
+    tools.gmail_mark_unread(["m1"])
+    tools.gmail_star(["m1"])
+    assert {"UNREAD", "STARRED"} <= labels_of(client, "m1")
+    tools.gmail_star(["m1"], starred=False)
+    assert "STARRED" not in labels_of(client, "m1")
+
+
+def test_trash_previews_until_confirmed_then_revert_untrashes(tmp_path):
+    client = FakeGmail(messages=[gmail_message("m1", subject="Invoice")])
+    tools, api = make(client, tmp_path=tmp_path)
+    preview = tools.gmail_trash(["m1"])
+    assert preview["preview"] and not preview["changed"] and '"Invoice"' in preview["message"]
+    assert "TRASH" not in labels_of(client, "m1") and api.changeset.records == []
+    done = tools.gmail_trash(["m1"], confirmed=True)
+    assert done["changed"] and "TRASH" in labels_of(client, "m1")
+    rec = api.changeset.records[-1]
+    assert rec["inverse"] == [{"command": "gmail_untrash", "params": {"ids": ["m1"], "account": ME}}]
+    revert(tools, rec)
+    assert "TRASH" not in labels_of(client, "m1")
+
+
+def test_trash_over_fifty_is_refused_untouched(tmp_path):
+    client = FakeGmail(messages=[gmail_message(f"m{i}") for i in range(51)])
+    tools, _ = make(client, tmp_path=tmp_path)
+    out = tools.gmail_trash([f"m{i}" for i in range(51)], confirmed=True)
+    assert out["ok"] is False and "limit of 50" in out["error"]
+    assert not any("TRASH" in m["labelIds"] for m in client.messages.values())
+
+
+def test_untrash_records_a_trash_inverse(tmp_path):
+    client = FakeGmail(messages=[gmail_message("m1", labels=("TRASH",))])
+    tools, api = make(client, tmp_path=tmp_path)
+    tools.gmail_untrash(["m1"])
+    assert api.changeset.records[-1]["inverse"][0]["params"] == {"ids": ["m1"], "confirmed": True, "account": ME}
+
+
+def test_label_create_delete_and_revert(tmp_path):
+    client = FakeGmail()
+    tools, api = make(client, tmp_path=tmp_path)
+    lid = tools.gmail_label_create("Projects/Island")["label"]["id"]
+    assert api.changeset.records[-1]["inverse"][0]["command"] == "gmail_label_delete"
+    preview = tools.gmail_label_delete("projects/island")
+    assert preview["preview"] and any(lab["id"] == lid for lab in client.labels)
+    tools.gmail_label_delete(lid, confirmed=True)
+    assert not any(lab["id"] == lid for lab in client.labels)
+    revert(tools, api.changeset.records[-1])
+    assert any(lab["name"] == "Projects/Island" for lab in client.labels)
+
+
+def test_system_labels_cannot_be_deleted(tmp_path):
+    tools, _ = make(FakeGmail(), tmp_path=tmp_path)
+    with pytest.raises(tg.ToolError, match="system label"):
+        tools.gmail_label_delete("INBOX", confirmed=True)
 
 
 def test_safe_filename_strips_paths_and_reserved_names():

@@ -10,6 +10,9 @@ agent run the same code.
   - Write: drafts, send, reply, forward. Sending tools are ``destructive_tools`` in
     plugin.json, so Ducky asks the person before each call; every write is recorded
     in the Changes ledger (a sent mail can't be unsent, so those are manual).
+  - Organize: labels, read/unread, archive, star with inverses that undo exactly what
+    changed (archive ↔ add INBOX); trash and label delete go through safety.py
+    (preview until confirmed, trash only, 50 at most).
 
 The Google sign-in lives elsewhere: ``accounts()`` names the connected accounts with
 Gmail turned on and ``client_for(account)`` returns a ``gmail.GmailClient`` for one.
@@ -50,6 +53,7 @@ safety = _sibling("safety")
 DEFAULT_MAX = 20
 LIST_MAX = 100
 ATTACHMENT_MAX_BYTES = 25 * 1024 * 1024  # Gmail's own attachment limit
+MODIFY_MAX = 500
 METADATA_HEADERS = ("From", "To", "Cc", "Subject", "Date")
 SYSTEM_LABELS = frozenset(
     {"INBOX", "UNREAD", "STARRED", "IMPORTANT", "SENT", "DRAFT", "SPAM", "TRASH", "CHAT"}
@@ -655,6 +659,162 @@ class GmailTools:
         res = c.send_raw(built["raw"], built["threadId"]) or {}
         return self._sent("gmail_forward", acct, res, mime.forward_subject(original.get("subject", "")), _str(to))
 
+    # ── organize ──────────────────────────────────────────────────────────
+
+    def _subjects(self, client: Any, ids: list[str]) -> list[dict[str, str]]:
+        """``[{id, label: subject}]`` for a preview; an unreadable id keeps its id as label."""
+        out = []
+        for mid in ids:
+            try:
+                p = mime.parse_message(client.get_message(mid, "metadata", metadata_headers=("Subject",)) or {})
+                out.append({"id": mid, "label": p.get("subject") or "(no subject)"})
+            except gmail.GmailError:
+                out.append({"id": mid, "label": mid})
+        return out
+
+    def _relabel(self, command: str, ids: Any, *, add: Any = None, remove: Any = None, account: str = "",
+                 done: str = "Changed labels on") -> dict[str, Any]:
+        """Add/remove labels and record an inverse that undoes only what really changed."""
+        acct = self.write_account(account)
+        c = self.client(acct)
+        picked = _ids(ids)
+        if not picked:
+            raise ToolError("ids is required: one or more message ids")
+        if len(picked) > MODIFY_MAX:
+            raise ToolError(f"{len(picked)} messages is over the limit of {MODIFY_MAX} per call; split it.")
+        labels = c.list_labels()
+        add_ids = [self.label_id(c, x, labels) for x in _ids(add)]
+        remove_ids = [self.label_id(c, x, labels) for x in _ids(remove)]
+        if not add_ids and not remove_ids:
+            raise ToolError("Give add_labels or remove_labels.")
+        before = {mid: set((c.get_message(mid, "minimal") or {}).get("labelIds") or []) for mid in picked}
+        c.batch_modify(picked, add_ids, remove_ids)
+        groups: dict[tuple[tuple[str, ...], tuple[str, ...]], list[str]] = {}
+        for mid, had in before.items():
+            added = tuple(sorted(set(add_ids) - had))
+            removed = tuple(sorted(set(remove_ids) & had))
+            if added or removed:
+                groups.setdefault((added, removed), []).append(mid)
+        changed = [mid for mids in groups.values() for mid in mids]
+        noun = "message" if len(changed) == 1 else "messages"
+        if changed:
+            inverse = [
+                {"command": "gmail_modify",
+                 "params": {"ids": mids, "add_labels": list(removed), "remove_labels": list(added), "account": acct}}
+                for (added, removed), mids in groups.items()
+            ]
+            self.record(command=command, kind="email", ident=",".join(changed), account=acct,
+                        summary=f"{done} {len(changed)} {noun}", inverse=inverse,
+                        before={"labels": {mid: sorted(before[mid]) for mid in changed}},
+                        targets=[{"kind": "email", "id": mid, "label": mid, "path": mid} for mid in changed])
+        return {"ok": True, "changed": len(changed), "ids": picked, "account": acct,
+                "message": f"{done} {len(changed)} {noun}." + (" Revert in the Changes tab undoes it." if changed else "")}
+
+    def gmail_modify(self, ids: list[str], add_labels: list[str] | None = None, remove_labels: list[str] | None = None,
+                     account: str = "") -> dict[str, Any]:
+        """Add and/or remove labels on messages (label names or ids, e.g. Receipts, STARRED, INBOX).
+
+        ids: message ids. Revert in the Changes tab puts back exactly what changed.
+        """
+        return self._relabel("gmail_modify", ids, add=add_labels, remove=remove_labels, account=account)
+
+    def gmail_mark_read(self, ids: list[str], account: str = "") -> dict[str, Any]:
+        """Mark messages as read."""
+        return self._relabel("gmail_mark_read", ids, remove=["UNREAD"], account=account, done="Marked read")
+
+    def gmail_mark_unread(self, ids: list[str], account: str = "") -> dict[str, Any]:
+        """Mark messages as unread."""
+        return self._relabel("gmail_mark_unread", ids, add=["UNREAD"], account=account, done="Marked unread")
+
+    def gmail_archive(self, ids: list[str], account: str = "") -> dict[str, Any]:
+        """Archive messages (take them out of the Inbox; Revert puts them back)."""
+        return self._relabel("gmail_archive", ids, remove=["INBOX"], account=account, done="Archived")
+
+    def gmail_star(self, ids: list[str], starred: bool = True, account: str = "") -> dict[str, Any]:
+        """Star messages, or unstar them with starred=false."""
+        if starred:
+            return self._relabel("gmail_star", ids, add=["STARRED"], account=account, done="Starred")
+        return self._relabel("gmail_star", ids, remove=["STARRED"], account=account, done="Unstarred")
+
+    def gmail_trash(self, ids: list[str], confirmed: bool = False, account: str = "") -> dict[str, Any]:
+        """Move messages to Trash (Google keeps them 30 days). Never deletes permanently.
+
+        Without confirmed=true this only previews: show the person those exact messages
+        with ducky_ask_user, then call again with confirmed=true after they say yes. At most
+        50 per confirmation. Revert in the Changes tab takes them out of Trash.
+        """
+        acct = self.write_account(account)
+        c = self.client(acct)
+        picked = _ids(ids)
+        items = self._subjects(c, picked) if 0 < len(picked) <= safety.MAX_ITEMS else picked
+        return safety.guarded_remove(
+            self.api,
+            command="gmail_trash",
+            kind="email",
+            noun="message",
+            items=items,
+            confirmed=bool(confirmed),
+            apply=lambda chosen: [c.trash_message(mid) for mid in chosen] and {"trashed": len(chosen)},
+            inverse=safety.untrash_inverse("gmail_untrash", account=acct),
+            account=acct,
+        )
+
+    def gmail_untrash(self, ids: list[str], account: str = "") -> dict[str, Any]:
+        """Take messages out of Trash (back where they were)."""
+        acct = self.write_account(account)
+        c = self.client(acct)
+        picked = _ids(ids)
+        if not picked:
+            raise ToolError("ids is required: one or more message ids")
+        for mid in picked:
+            c.untrash_message(mid)
+        noun = "message" if len(picked) == 1 else "messages"
+        self.record(command="gmail_untrash", kind="email", ident=",".join(picked), account=acct,
+                    summary=f"Took {len(picked)} {noun} out of Trash",
+                    inverse=[{"command": "gmail_trash", "params": {"ids": picked, "confirmed": True, "account": acct}}],
+                    targets=[{"kind": "email", "id": mid, "label": mid, "path": mid} for mid in picked])
+        return {"ok": True, "changed": len(picked), "ids": picked, "account": acct,
+                "message": f"Took {len(picked)} {noun} out of Trash."}
+
+    def gmail_label_create(self, name: str, account: str = "") -> dict[str, Any]:
+        """Create a Gmail label (nested with a slash: Projects/Island)."""
+        acct = self.write_account(account)
+        c = self.client(acct)
+        label = c.create_label(_str(name)) or {}
+        lid = _str(label.get("id"))
+        self.record(command="gmail_label_create", kind="label", ident=lid, account=acct,
+                    summary=f"Created label “{label.get('name') or name}”",
+                    inverse=[{"command": "gmail_label_delete", "params": {"label": lid, "confirmed": True, "account": acct}}],
+                    targets=[{"kind": "label", "id": lid, "label": _str(label.get("name") or name), "path": lid}])
+        return {"ok": True, "label": {"id": lid, "name": label.get("name") or _str(name)}, "account": acct}
+
+    def gmail_label_delete(self, label: str, confirmed: bool = False, account: str = "") -> dict[str, Any]:
+        """Delete one of your Gmail labels (the mail itself stays). System labels can't be deleted.
+
+        Without confirmed=true this only previews; ask the person first, then call again
+        with confirmed=true. Revert recreates the label (empty).
+        """
+        acct = self.write_account(account)
+        c = self.client(acct)
+        labels = c.list_labels()
+        lid = self.label_id(c, label, labels)
+        found = next((lab for lab in labels if lab.get("id") == lid), None)
+        if found is None or found.get("type") == "system" or lid in SYSTEM_LABELS or lid.startswith("CATEGORY_"):
+            raise ToolError(f"{label} is a Gmail system label and can't be deleted.")
+        name = _str(found.get("name")) or lid
+        return safety.guarded_remove(
+            self.api,
+            command="gmail_label_delete",
+            kind="label",
+            noun="label",
+            verb="delete label",
+            items=[{"id": lid, "label": name}],
+            confirmed=bool(confirmed),
+            apply=lambda chosen: [c.delete_label(x) for x in chosen] and {"deleted": len(chosen)},
+            inverse=[{"command": "gmail_label_create", "params": {"name": name, "account": acct}}],
+            account=acct,
+        )
+
 
 READ_TOOLS = (
     "gmail_list",
@@ -675,7 +835,18 @@ WRITE_TOOLS = (
     "gmail_reply",
     "gmail_forward",
 )
-TOOL_NAMES = READ_TOOLS + WRITE_TOOLS
+ORGANIZE_TOOLS = (
+    "gmail_modify",
+    "gmail_mark_read",
+    "gmail_mark_unread",
+    "gmail_archive",
+    "gmail_star",
+    "gmail_trash",
+    "gmail_untrash",
+    "gmail_label_create",
+    "gmail_label_delete",
+)
+TOOL_NAMES = READ_TOOLS + WRITE_TOOLS + ORGANIZE_TOOLS
 
 
 def _safe(method: Callable[..., dict[str, Any]]) -> Callable[..., dict[str, Any]]:

@@ -17,7 +17,7 @@ import zipfile  # noqa: F401 — re-exported for scripts/selfcheck.py
 from pathlib import Path
 from typing import Any
 
-from . import auth
+from . import auth, display
 from .auth import (  # noqa: F401 — re-exported for scripts/selfcheck.py
     KEY_API,
     PLUGIN_ID,
@@ -468,5 +468,12 @@ def register(api: Any) -> None:
             return {"ok": True, "path": result["path"], "result": result}
         except Exception as exc:  # noqa: BLE001
             return {"ok": False, "error": str(exc) or exc.__class__.__name__}
+
+    display.register(api)
+
+    @api.tool(listener=False)
+    def google_open_pending(pretty: bool = False) -> str:
+        """Take the last google_open request (view, item, search) once, as the Google tab does on open."""
+        return _tool_json({"ok": True, "request": display.take_pending_open()}, pretty=pretty)
 
     api.log("Google Drive tools registered")

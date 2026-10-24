@@ -28,6 +28,7 @@ TOOLS = {
     "gdrive_file_info",
     "gdrive_download",
     "gdrive_import_to_uefn",
+    "google_open",
 }
 
 
@@ -35,6 +36,7 @@ class FakeApi:
     def __init__(self) -> None:
         self.tools: dict[str, dict] = {}
         self.nodes: dict[str, object] = {}
+        self.rpcs: dict[str, object] = {}
 
     def tool(self, fn=None, *, name=None, intent=None, listener=True):
         def deco(f):
@@ -49,6 +51,12 @@ class FakeApi:
             return f
 
         return deco(handler) if handler else deco
+
+    def register_panel_rpc(self, name, fn):
+        self.rpcs[name] = fn
+
+    def call_tool(self, name, arguments=None):
+        raise RuntimeError("no panel open")
 
     def listener(self, *a, **k):
         raise RuntimeError("listener offline")
@@ -80,6 +88,14 @@ def test_register_keeps_tools_and_nodes(api):
     # Only the import tool talks to the UEFN editor.
     assert [n for n, t in api.tools.items() if t["listener"]] == ["gdrive_import_to_uefn"]
     assert set(api.nodes) == {"googledrive.list", "googledrive.download"}
+    assert "google_open_pending" in api.rpcs
+
+
+def test_google_open_gives_link_without_panel(api):
+    out = _call(api, "google_open", view="gmail")
+    assert out["ok"] and out["navigated"] is False
+    assert out["link"] == "plugin:googledrive/main?view=gmail"
+    assert api.rpcs["google_open_pending"]()["view"] == "gmail"
 
 
 def test_modules_own_their_parts():

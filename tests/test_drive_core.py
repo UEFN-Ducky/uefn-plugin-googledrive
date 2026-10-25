@@ -198,6 +198,25 @@ def test_poller_runs_once_and_restarts_cleanly(api):
     assert first.poll_once() == {"paused": True, "emitted": 0}
 
 
+@pytest.mark.parametrize("role", ["tool_server", "agent_host"])
+def test_no_poller_outside_the_app(role, api, monkeypatch):
+    import types
+
+    fake = types.ModuleType("backend.process_role")
+    fake.role = lambda: role
+    monkeypatch.setitem(sys.modules, "backend.process_role", fake)
+    gd.register(FakeApi())
+    assert gd._POLLER is None
+
+
+def test_old_core_falls_back_to_the_bridge_flag(monkeypatch):
+    monkeypatch.setitem(sys.modules, "backend.process_role", None)  # import raises ImportError
+    monkeypatch.setenv("UEFN_DUCKY_MCP_BRIDGE", "1")
+    assert gd._in_app() is False
+    monkeypatch.delenv("UEFN_DUCKY_MCP_BRIDGE")
+    assert gd._in_app() is True
+
+
 def test_google_open_gives_link_without_panel(api):
     out = _call(api, "google_open", view="gmail")
     assert out["ok"] and out["navigated"] is False

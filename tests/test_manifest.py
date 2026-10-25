@@ -14,7 +14,7 @@ TOOLS = CONTRIB["agent.tools"]
 def test_identity_kept_for_existing_users():
     assert MANIFEST["id"] == "googledrive"
     assert MANIFEST["label"] == "Google Workspace"
-    assert MANIFEST["version"] == "1.1.0"
+    assert MANIFEST["version"] == "1.1.1"
     assert MANIFEST["min_app_version"] == "1.2.357"
     assert MANIFEST["data_sharing"] is False
     assert MANIFEST["default_enabled"] is False

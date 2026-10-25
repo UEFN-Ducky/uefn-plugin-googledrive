@@ -11,6 +11,7 @@ Modules: ``auth`` (secrets, the Google-only HTTP core, OAuth sign-in) and
 from __future__ import annotations
 
 import json
+import os
 import re
 import time  # noqa: F401 — re-exported for scripts/selfcheck.py
 import zipfile  # noqa: F401 — re-exported for scripts/selfcheck.py
@@ -123,6 +124,16 @@ def _poll_seconds() -> Any:
     from .drive import _prefs
 
     return _prefs().get("gmail_poll_seconds") or poller.DEFAULT_INTERVAL_S
+
+
+def _in_app() -> bool:
+    """The app window, not a tool server or an agent host: only it checks for new mail,
+    so each message starts its workflows once."""
+    try:
+        from backend.process_role import role
+    except ImportError:  # a core without process roles
+        return os.environ.get("UEFN_DUCKY_MCP_BRIDGE") != "1"
+    return role() == "app"
 
 
 def shutdown() -> None:
@@ -496,7 +507,8 @@ def register(api: Any) -> None:
     nodes.register(api)
 
     shutdown()  # a reinstall registers again: never two pollers
-    _POLLER = poller.Poller(api, accounts=auth.gmail_accounts, store_for=store_for, interval=_poll_seconds)
-    _POLLER.start()
+    if _in_app():
+        _POLLER = poller.Poller(api, accounts=auth.gmail_accounts, store_for=store_for, interval=_poll_seconds)
+        _POLLER.start()
 
     api.log("Google Workspace tools registered")

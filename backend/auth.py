@@ -152,7 +152,12 @@ def build_auth_url(
 
 
 def _get_secret(name: str) -> str:
-    from backend.agent.secrets import get_key
+    # Fresh, not this process's cached copy: the app and the MCP bridge are separate
+    # processes, and a sign-in saved in one must show in the other (agents read via the bridge).
+    try:
+        from backend.agent.secrets import get_key_fresh as get_key
+    except ImportError:  # an older app without it
+        from backend.agent.secrets import get_key
 
     return (get_key(name) or "").strip()
 
@@ -614,9 +619,9 @@ def done_page(ok: bool) -> str:
         parts = {
             "__TONE__": "#fbb034",
             "__MARK__": "M27 43 L37 53 L58 31",
-            "__TITLE__": "You're connected",
-            "__TEXT__": "Google is linked to UEFN Ducky. Your mail and files stay on this PC.",
-            "__HINT__": "You can close this tab and go back to <b>UEFN Ducky</b>.",
+            "__TITLE__": "Google said yes",
+            "__TEXT__": "UEFN Ducky is finishing your sign-in now. Your mail and files stay on this PC.",
+            "__HINT__": "Close this tab: your account shows in <b>UEFN Ducky</b>'s Google tab in a moment.",
         }
     else:
         parts = {

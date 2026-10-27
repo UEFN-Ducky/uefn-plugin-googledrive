@@ -272,9 +272,25 @@ def test_own_client_skips_google_connect(env):
 
 def test_done_page_is_self_contained_and_hides_the_code():
     ok, failed = auth.done_page(True), auth.done_page(False)
-    assert "You're connected" in ok and "didn't finish" in failed and "__" not in ok + failed
+    # Google's redirect only carries the code: the page never claims the sign-in is done.
+    assert "finishing your sign-in" in ok and "connected" not in ok.lower()
+    assert "didn't finish" in failed and "__" not in ok + failed
     assert "http" not in ok.replace("http-equiv", "")  # no outside fonts, scripts or pictures
     assert "history.replaceState" in ok  # the one-time code leaves the address bar
+
+
+def test_secrets_are_read_fresh_not_from_the_process_cache(monkeypatch):
+    """A sign-in saved by the app must show in the MCP bridge (another process) at once."""
+    import sys
+    import types
+
+    store = {"google_accounts": "old"}
+    fake = types.ModuleType("backend.agent.secrets")
+    fake.get_key = lambda k: "stale-cache"
+    fake.get_key_fresh = lambda k: store.get(k)
+    monkeypatch.setitem(sys.modules, "backend.agent.secrets", fake)
+    store["google_accounts"] = "new"
+    assert auth._get_secret("google_accounts") == "new"
 
 
 def test_host_allowlist():

@@ -57,6 +57,7 @@ class Google:
         self.refresh_answer: dict = {"access_token": "at-fresh", "expires_in": 3600}
         self.email = ME
         self.broker_refresh: dict | None = None
+        self.broker_client: dict = {"ok": True, "payload": {"client_id": "broker-client.apps.googleusercontent.com"}}
 
     def open(self, url, *, headers=None, data=None, method=None, timeout=60.0):
         _CHECK_URL(url)  # every request must pass the real host allowlist
@@ -67,6 +68,8 @@ class Google:
             parsed = {}
         self.requests.append({"url": url, "body": parsed, "headers": dict(headers or {})})
         granted = " ".join(self.auth_urls[-1]["scope"].split()) if self.auth_urls else READ
+        if url.endswith("/collect/client"):  # the public client id, set once in Admin
+            return Resp(self.broker_client)
         if url.endswith("/collect/token"):  # Google Connect's answer: {ok, payload: {tokens}}
             tokens = {"access_token": "at1", "refresh_token": "rt1", "expires_in": 3600, "scope": granted}
             return Resp({"ok": True, "payload": {"tokens": tokens}})
@@ -104,7 +107,7 @@ def env(monkeypatch):
     monkeypatch.setattr(auth, "_set_secret", lambda k, v: secrets.__setitem__(k, v))
     monkeypatch.setattr(auth, "_open", google.open)
     monkeypatch.setattr(auth, "_open_browser", google.browser)
-    monkeypatch.setattr(auth, "GOOGLE_CONNECT_CLIENT_ID", "broker-client.apps.googleusercontent.com")
+    monkeypatch.setattr(auth, "_BROKER_CLIENT_ID", "")
     api = FakeApi()
     auth.bind(api)
     yield {"secrets": secrets, "google": google, "api": api}
@@ -148,12 +151,16 @@ def test_connect_via_google_connect_then_turn_on_gmail(env):
     assert not g.to("oauth2.googleapis.com")  # the secret side is Google Connect's
     assert env["api"].calls[0] == ("account_session_token", {"audience": "google-connect"})
     assert auth.gmail_accounts() == []
+    # The client id came from Google Connect, with a sign-in proof, and is asked once per run.
+    asked = [r for r in g.requests if r["url"].endswith("/collect/client")]
+    assert len(asked) == 1 and asked[0]["body"]["proof"].startswith("udp1_")
 
     more = auth.connect([GMAIL], account=ME, timeout_s=10)
     q = g.auth_urls[1]
     assert q["scope"].split() == [READ, GMAIL] and q["include_granted_scopes"] == "true" and q["login_hint"] == ME
     assert more["added"] == [GMAIL] and more["denied"] == []
     assert auth.gmail_accounts() == [ME]
+    assert len([r for r in g.requests if r["url"].endswith("/collect/client")]) == 1
     assert [a["email"] for a in auth.list_accounts()] == [ME]  # same account, not a second one
     assert "access_token" not in auth.list_accounts()[0] and "refresh_token" not in auth.list_accounts()[0]
 
@@ -211,12 +218,15 @@ def test_scope_check_and_invalid_grant(env, monkeypatch):
     assert auth.gmail_accounts() == [] and auth._load_token() is None
 
 
-def test_build_without_client_id_says_so(env, monkeypatch):
-    monkeypatch.setattr(auth, "GOOGLE_CONNECT_CLIENT_ID", "")
-    assert auth.sign_in_ready() is False and auth._using_bundled_client() is False
-    with pytest.raises(ValueError, match="isn't set up in this build"):
+def test_site_without_client_id_says_so(env):
+    env["google"].broker_client = {"ok": False, "error": "Google Connect is not configured"}
+    with pytest.raises(ValueError, match="not configured"):
         auth.connect(timeout_s=10)
-    assert env["google"].requests == [] and env["google"].auth_urls == []
+    env["google"].broker_client = {"ok": True, "payload": {"client_id": ""}}
+    with pytest.raises(ValueError, match="isn't set up on uefnducky.org"):
+        auth.connect(timeout_s=10)
+    assert env["google"].auth_urls == []  # Google's consent page never opened
+    assert not [r for r in env["google"].requests if r["url"].endswith("/collect/token")]
 
 
 def test_no_ducky_sign_in_means_no_google_sign_in(env):

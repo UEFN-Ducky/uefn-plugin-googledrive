@@ -235,9 +235,9 @@ def test_status_signed_out_has_drive_details(api, tmp_path):
     for name in ("google_status", "gdrive_status"):
         out = _call(api, name)
         assert out["ok"], out
-        assert out["count"] == 0 and out["sign_in_ready"] is False
-        # No own client and no Google Connect client id in this build yet.
-        assert out["sign_in_kind"] == "none"
+        assert out["count"] == 0
+        # No own client: sign-in goes through Google Connect, which holds the client id.
+        assert out["sign_in_ready"] is True and out["sign_in_kind"] == "bundled"
         assert out["access_modes"] == ["public"] and out["staging_dir"] == str(tmp_path)
 
 

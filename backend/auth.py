@@ -10,7 +10,8 @@ Who holds the client secret:
     and every refresh go through ``POST {BROKER_BASE}/token`` / ``/refresh`` with a
     UEFN Ducky sign-in proof from the Account plugin
     (``api.call_tool("account_session_token", {"audience": "google-connect"})``).
-    The public client id ships here (``GOOGLE_CONNECT_CLIENT_ID``). Answers are
+    The public client id comes from Google Connect too (``collect/client``, set once in
+    Admin), so no build carries one. Answers are
     ``{ok, payload: {tokens}}``; ``google_reauth_required`` means sign in again.
   - **Your own client** (Settings → Advanced: client id + secret): Google Connect is
     skipped and the plugin talks to Google's token endpoint itself.
@@ -62,9 +63,7 @@ BROKER_ORIGIN = "https://uefnducky.org"
 BROKER_BASE = f"{BROKER_ORIGIN}/api/v1/plugins/google-connect/collect"
 BROKER_AUDIENCE = "google-connect"
 PROOF_TOOL = "account_session_token"
-# The Desktop app OAuth client whose secret Google Connect holds. A client id is public
-# (it is in every sign-in URL); empty until that Google Cloud client exists.
-GOOGLE_CONNECT_CLIENT_ID = ""
+_BROKER_CLIENT_ID = ""  # Google Connect's public client id, asked once per run
 
 CONNECT_TIMEOUT_MAX_S = 300.0
 
@@ -325,12 +324,17 @@ def _broker_post(event: str, body: dict[str, Any]) -> dict[str, Any]:
 
 
 def _broker_client_id() -> str:
-    if not GOOGLE_CONNECT_CLIENT_ID:
-        raise ValueError(
-            "One-click Google sign-in isn't set up in this build yet. Use your own OAuth "
-            "client in Settings → Google → Advanced, or public share links with gdrive_download."
-        )
-    return GOOGLE_CONNECT_CLIENT_ID
+    """The Desktop app client id Google Connect signs in with (public; the secret stays there)."""
+    global _BROKER_CLIENT_ID
+    if not _BROKER_CLIENT_ID:
+        client_id = str(_broker_post("client", {}).get("client_id") or "").strip()
+        if not client_id.endswith(".apps.googleusercontent.com"):
+            raise ValueError(
+                "One-click Google sign-in isn't set up on uefnducky.org yet. Use your own OAuth "
+                "client in Settings → Google → Advanced, or public share links with gdrive_download."
+            )
+        _BROKER_CLIENT_ID = client_id
+    return _BROKER_CLIENT_ID
 
 
 # --------------------------------------------------------------------------- #
@@ -350,11 +354,11 @@ def _uses_own_client() -> bool:
 
 def _using_bundled_client() -> bool:
     """True when sign-in goes through Google Connect (no own client set in Settings)."""
-    return not _uses_own_client() and _API is not None and bool(GOOGLE_CONNECT_CLIENT_ID)
+    return not _uses_own_client() and _API is not None
 
 
 def sign_in_ready() -> bool:
-    return _uses_own_client() or (_API is not None and bool(GOOGLE_CONNECT_CLIENT_ID))
+    return _uses_own_client() or _API is not None
 
 
 def _legacy_token() -> dict[str, Any] | None:

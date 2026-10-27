@@ -554,6 +554,84 @@ def _access_token() -> str:
 # --------------------------------------------------------------------------- #
 
 
+# The page Google's redirect lands on, in UEFN Ducky's look. Self-contained: no outside
+# fonts, scripts or pictures. Its script only takes the one-time code out of the address bar.
+_DONE_PAGE = """<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="dark">
+<title>UEFN Ducky × Google</title>
+<style>
+:root{--bg:#0a0a0a;--card:#141414;--border:#262626;--fg:#ededed;--muted:#a1a1a1;--tone:__TONE__}
+*{box-sizing:border-box}
+html,body{margin:0;height:100%;background:var(--bg);color:var(--fg);
+  font:15px/1.5 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}
+body{display:grid;place-items:center;overflow:hidden}
+.glow{position:fixed;width:560px;height:560px;border-radius:50%;
+  background:radial-gradient(circle,color-mix(in srgb,var(--tone) 22%,transparent),transparent 65%);
+  filter:blur(10px);animation:breathe 5s ease-in-out infinite}
+.card{position:relative;width:min(420px,calc(100vw - 32px));padding:36px 32px 28px;text-align:center;
+  background:var(--card);border:1px solid var(--border);border-radius:20px;
+  box-shadow:0 24px 64px rgba(0,0,0,.55);animation:rise .6s cubic-bezier(.2,.8,.2,1) both}
+.brand{display:flex;align-items:center;justify-content:center;gap:10px;margin-bottom:26px;
+  font-weight:600;letter-spacing:.2px;color:var(--muted);font-size:13px;text-transform:uppercase}
+.brand b{color:var(--fg);font-weight:700}
+.badge{width:84px;height:84px;margin:0 auto 22px;animation:pop .5s .25s cubic-bezier(.3,1.6,.5,1) both}
+.badge circle{fill:color-mix(in srgb,var(--tone) 14%,transparent);stroke:var(--tone);stroke-width:3;
+  stroke-dasharray:240;stroke-dashoffset:240;animation:draw .7s .3s ease-out forwards}
+.badge path{fill:none;stroke:var(--tone);stroke-width:5;stroke-linecap:round;stroke-linejoin:round;
+  stroke-dasharray:60;stroke-dashoffset:60;animation:draw .45s .85s ease-out forwards}
+h1{margin:0 0 8px;font-size:22px;font-weight:700;animation:fade .5s .5s both}
+p{margin:0;color:var(--muted);animation:fade .5s .65s both}
+.hint{margin-top:22px;padding:10px 14px;border-radius:12px;background:#1b1b1b;border:1px solid var(--border);
+  font-size:13px;color:var(--muted);animation:fade .5s .8s both}
+.hint b{color:var(--tone);font-weight:600}
+@keyframes rise{from{opacity:0;transform:translateY(18px) scale(.98)}to{opacity:1;transform:none}}
+@keyframes pop{from{transform:scale(.6);opacity:0}to{transform:none;opacity:1}}
+@keyframes draw{to{stroke-dashoffset:0}}
+@keyframes fade{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:none}}
+@keyframes breathe{0%,100%{transform:scale(1);opacity:.9}50%{transform:scale(1.08);opacity:1}}
+@media (prefers-reduced-motion:reduce){*,*::before,*::after{animation:none!important}
+  .badge circle,.badge path{stroke-dashoffset:0}}
+</style></head>
+<body>
+<div class="glow" aria-hidden="true"></div>
+<main class="card" role="status">
+  <div class="brand"><span aria-hidden="true">\U0001f986</span><b>UEFN Ducky</b><span>× Google</span></div>
+  <svg class="badge" viewBox="0 0 84 84" aria-hidden="true"><circle cx="42" cy="42" r="38"/><path d="__MARK__"/></svg>
+  <h1>__TITLE__</h1>
+  <p>__TEXT__</p>
+  <div class="hint">__HINT__</div>
+</main>
+<script>history.replaceState(null, "", location.pathname);</script>
+</body></html>
+"""
+
+
+def done_page(ok: bool) -> str:
+    """The redirect page: a check on amber when signed in, a cross on red when not."""
+    if ok:
+        parts = {
+            "__TONE__": "#fbb034",
+            "__MARK__": "M27 43 L37 53 L58 31",
+            "__TITLE__": "You're connected",
+            "__TEXT__": "Google is linked to UEFN Ducky. Your mail and files stay on this PC.",
+            "__HINT__": "You can close this tab and go back to <b>UEFN Ducky</b>.",
+        }
+    else:
+        parts = {
+            "__TONE__": "#ef4444",
+            "__MARK__": "M31 31 L53 53 M53 31 L31 53",
+            "__TITLE__": "Sign-in didn't finish",
+            "__TEXT__": "Google sign-in was cancelled or failed. Nothing was changed.",
+            "__HINT__": "Close this tab and press <b>Sign in with Google</b> in UEFN Ducky again.",
+        }
+    page = _DONE_PAGE
+    for key, value in parts.items():
+        page = page.replace(key, value)
+    return page
+
+
 class _CallbackHandler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:  # noqa: N802 — BaseHTTPRequestHandler API
         query = urllib.parse.urlparse(self.path).query
@@ -562,15 +640,10 @@ class _CallbackHandler(BaseHTTPRequestHandler):
             self.server.oauth_result = params  # type: ignore[attr-defined]
         self.send_response(200)
         self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Referrer-Policy", "no-referrer")  # the address holds the one-time code
         self.end_headers()
-        ok = "code" in params
-        msg = "You're connected — close this tab and return to UEFN Ducky." if ok else (
-            "Sign-in was cancelled or failed. Close this tab and try again from UEFN Ducky."
-        )
-        self.wfile.write(
-            f"<html><body style='font-family:sans-serif;padding:2rem'><h2>UEFN Ducky × Google"
-            f"</h2><p>{msg}</p></body></html>".encode("utf-8")
-        )
+        self.wfile.write(done_page("code" in params).encode("utf-8"))
 
     def log_message(self, *args: Any) -> None:  # silence per-request stderr noise
         return

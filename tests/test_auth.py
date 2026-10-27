@@ -270,6 +270,13 @@ def test_own_client_skips_google_connect(env):
     assert auth._using_bundled_client() is False
 
 
+def test_done_page_is_self_contained_and_hides_the_code():
+    ok, failed = auth.done_page(True), auth.done_page(False)
+    assert "You're connected" in ok and "didn't finish" in failed and "__" not in ok + failed
+    assert "http" not in ok.replace("http-equiv", "")  # no outside fonts, scripts or pictures
+    assert "history.replaceState" in ok  # the one-time code leaves the address bar
+
+
 def test_host_allowlist():
     for host in ("gmail.googleapis.com", "uefnducky.org", "oauth2.googleapis.com", "doc-0s.googleusercontent.com"):
         assert auth._host_ok(host)

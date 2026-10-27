@@ -1,7 +1,7 @@
 {
   "id": "googledrive",
   "kind": "plugin",
-  "version": "1.1.1",
+  "version": "1.1.2",
   "label": "Google Workspace",
   "description": "Gmail and Google Drive in one tab, with one Google sign-in. Read, search, draft and organize mail across several Google accounts, and pull 3D models, textures and audio from Drive straight into UEFN (allowlisted types, size caps, nothing executed). Ducky can do everything the tab can; sending, trash and sharing always ask first, and mail stays on this PC.",
   "min_app_version": "1.2.357",

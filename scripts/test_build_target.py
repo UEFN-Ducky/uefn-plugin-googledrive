@@ -29,6 +29,11 @@ def test_check_target() -> None:
     assert _refused(bz.check_target, "linux-arm64", "linux", "x86_64")
     assert _refused(bz.check_target, "linux-x86_64", "win32", "AMD64")
     assert _refused(bz.check_target, "linux-mips", "linux", "mips")
+    bz.check_target("macos-arm64", "darwin", "arm64")
+    bz.check_target("macos-x64", "darwin", "x86_64")
+    assert _refused(bz.check_target, "macos-arm64", "darwin", "x86_64")
+    assert _refused(bz.check_target, "macos-arm64", "linux", "aarch64")
+    assert _refused(bz.check_target, "linux-arm64", "darwin", "arm64")
 
 
 def test_check_zip_target() -> None:
@@ -38,6 +43,9 @@ def test_check_zip_target() -> None:
             ("cpython-313-x86_64-linux-gnu", "linux-x86_64", True),
             ("cpython-313-aarch64-linux-gnu", "linux-arm64", True),
             ("cp313-win_amd64", "linux-x86_64", False),
+            ("cpython-313-darwin-arm64", "macos-arm64", True),
+            ("cpython-313-darwin-x86_64", "macos-x64", True),
+            ("cpython-313-darwin-x86_64", "macos-arm64", False),
         ):
             with zipfile.ZipFile(z, "w") as zf:
                 zf.writestr("plugin.json", json.dumps({"compiled": True, "python_abi": abi}))

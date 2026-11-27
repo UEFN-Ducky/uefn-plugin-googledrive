@@ -116,7 +116,7 @@ def _find_ducky_repo() -> Path:
 
 
 def _ducky_python(repo: Path) -> str:
-    if sys.platform.startswith("linux"):
+    if sys.platform != "win32":
         venv = repo / ".venv" / "bin" / "python"
     else:
         venv = repo / ".venv" / "Scripts" / "python.exe"
@@ -124,10 +124,13 @@ def _ducky_python(repo: Path) -> str:
 
 
 # --target -> (platform.machine() names that build it, python_abi ending the build must carry).
-# Nuitka can't cross-compile a module, so each target builds on its own kind of Linux machine.
+# Nuitka can't cross-compile a module, so each target builds on its own kind of machine
+# (macOS: GitHub's macos-26 / macos-15-intel runners).
 LINUX_TARGETS = {
     "linux-x86_64": (("x86_64", "amd64"), "-x86_64-linux-gnu"),
     "linux-arm64": (("aarch64", "arm64"), "-aarch64-linux-gnu"),
+    "macos-arm64": (("arm64", "aarch64"), "-darwin-arm64"),
+    "macos-x64": (("x86_64",), "-darwin-x86_64"),
 }
 
 
@@ -139,7 +142,8 @@ def check_target(target: str, plat: str | None = None, machine: str | None = Non
     machine = (platform.machine() if machine is None else machine).lower()
     if target not in LINUX_TARGETS:
         raise SystemExit(f"unknown --target {target!r} (choose {', '.join(LINUX_TARGETS)})")
-    if not plat.startswith("linux") or machine not in LINUX_TARGETS[target][0]:
+    host_os = "macos" if plat == "darwin" else "linux" if plat.startswith("linux") else plat
+    if not target.startswith(host_os + "-") or machine not in LINUX_TARGETS[target][0]:
         raise SystemExit(
             f"--target {target} builds on a {target} machine (this is {plat} {machine}): "
             "Nuitka can't cross-compile, run it there (CI: a runner of that CPU)"
@@ -192,7 +196,7 @@ def build_compiled_zip(*, out: Path | None = None, release: bool = False, target
     if target:
         print(f"python_abi {check_zip_target(dest, target)}")
     print(f"wrote {dest} ({dest.stat().st_size} bytes)")
-    # A Linux build prunes only its own target's zips (the Windows one and the other CPU stay).
+    # A Linux/macOS build prunes only its own target's zips (the Windows one and the other CPU stay).
     _prune_superseded_zips(dest, f"*-{target}-compiled.ducky-plugin.zip" if target else "*.ducky-plugin.zip")
     return dest
 
@@ -209,7 +213,7 @@ if __name__ == "__main__":
     ap.add_argument(
         "--target",
         choices=sorted(LINUX_TARGETS),
-        help="compiled Linux build (.so) for this CPU; run it on a machine of that CPU",
+        help="compiled Linux/macOS build (.so) for this CPU; run it on a machine of that OS and CPU",
     )
     args = ap.parse_args()
     if args.target:
